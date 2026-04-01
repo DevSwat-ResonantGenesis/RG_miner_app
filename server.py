@@ -89,6 +89,7 @@ _ws_clients: set = set()
 # ── Helpers ──
 
 async def broadcast(msg: dict):
+    global _ws_clients
     dead = set()
     for ws in _ws_clients:
         try:
