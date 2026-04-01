@@ -5,20 +5,22 @@ RG MINER APP — Local Mining Client with Platform Auth
 
 Standalone app that any user can download to mine on ResonantGenesis:
 
-  1. Login with your platform account (same as Resonant IDE)
-  2. View model registry, network status, training data sources
+  1. Click "Sign in with ResonantGenesis" → opens platform login in browser
+  2. Platform authenticates → redirects token back to local app
   3. Start real PyTorch training on your GPU
   4. Monitor loss, rewards, and network stats in real-time
   5. Earn $RGT tokens
+
+Auth flow (identical to Resonant IDE Extension):
+  1. App opens browser → https://dev-swat.com/auth/desktop-callback?port=3000
+  2. Platform checks if logged in → if not, shows login page
+  3. After login, platform redirects → http://127.0.0.1:3000/auth-callback?token=JWT
+  4. Local app stores token, shows dashboard
 
 Usage:
     pip install -r requirements.txt
     python server.py
     # Open http://localhost:3000
-
-Architecture:
-    Local FastAPI server → proxies auth + API calls to production
-    Same auth flow as Resonant IDE Extension (JWT from platform login)
 """
 
 import asyncio
@@ -144,72 +146,73 @@ static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
-# ── Auth ──
+# ══════════════════════════════════════════════════════════════
+# AUTH — Desktop Callback (same as Resonant IDE Extension)
+# ══════════════════════════════════════════════════════════════
 
-@app.post("/api/login")
-async def login(request: Request):
-    """Authenticate via platform auth (same flow as Resonant IDE)."""
-    body = await request.json()
-    email = body.get("email", "")
-    password = body.get("password", "")
-
-    if not email or not password:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Email and password required"})
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(f"{AUTH_URL}/auth/login", json={"email": email, "password": password})
-
-            if resp.status_code == 200:
-                data = resp.json()
-                token = data.get("access_token") or data.get("token", "")
-                user = data.get("user", {})
-
-                miner_state["jwt_token"] = token
-                miner_state["user_email"] = email
-                miner_state["user_id"] = user.get("id", "")
-                miner_state["miner_id"] = f"miner-{email.split('@')[0]}-{uuid4().hex[:6]}"
-                miner_state["error"] = None
-
-                dev, _, dev_name = _detect_device()
-                return {
-                    "success": True,
-                    "email": email,
-                    "user_id": miner_state["user_id"],
-                    "miner_id": miner_state["miner_id"],
-                    "device": dev_name,
-                    "platform": PROD_BASE,
-                }
-            else:
-                detail = "Invalid credentials"
-                try:
-                    detail = resp.json().get("detail", detail)
-                except Exception:
-                    pass
-                return JSONResponse(status_code=401, content={"success": False, "error": detail})
-    except httpx.ConnectError:
-        return JSONResponse(status_code=503, content={"success": False, "error": f"Cannot reach platform at {PROD_BASE}"})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
-
-
-@app.post("/api/login-token")
-async def login_with_token(request: Request):
-    """Login with existing JWT (for dev/testing)."""
-    body = await request.json()
-    token = body.get("token", "")
-    email = body.get("email", "user@resonantgenesis.com")
-
+@app.get("/auth-callback")
+async def auth_callback(request: Request):
+    """
+    Receives JWT token from platform after browser login.
+    Flow: platform redirects → http://127.0.0.1:3000/auth-callback?token=JWT
+    This is identical to how the Resonant IDE Extension receives tokens.
+    """
+    token = request.query_params.get("token", "")
     if not token:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Token required"})
+        return HTMLResponse(content="<h2>Authentication failed</h2><p>No token received. <a href='/'>Try again</a></p>", status_code=400)
+
+    # Decode JWT to get user info (no verification needed — platform already verified)
+    try:
+        import base64
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (4 - len(payload_b64) % 4)
+        payload = json.loads(base64.b64decode(payload_b64))
+        email = payload.get("email", "miner@resonantgenesis.com")
+        user_id = payload.get("user_id", "")
+    except Exception:
+        email = "miner@resonantgenesis.com"
+        user_id = ""
 
     miner_state["jwt_token"] = token
     miner_state["user_email"] = email
+    miner_state["user_id"] = user_id
     miner_state["miner_id"] = f"miner-{email.split('@')[0]}-{uuid4().hex[:6]}"
     miner_state["error"] = None
 
     dev, _, dev_name = _detect_device()
-    return {"success": True, "email": email, "miner_id": miner_state["miner_id"], "device": dev_name}
+    logger.info(f"Authenticated: {email} | Device: {dev_name}")
+
+    # Show success page that auto-redirects to dashboard
+    return HTMLResponse(content=f"""
+    <!DOCTYPE html><html><head><meta charset="UTF-8">
+    <title>RG Miner — Authenticated</title>
+    <style>body{{background:#0a0a0f;color:#e0e0e8;font-family:system-ui;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
+    .card{{background:#12121a;border:1px solid #2a2a3e;border-radius:16px;padding:40px;text-align:center;max-width:400px}}
+    .check{{font-size:48px;margin-bottom:16px}} .email{{color:#a29bfe;font-weight:600}} .btn{{display:inline-block;margin-top:20px;padding:12px 32px;background:#6c5ce7;color:white;border-radius:8px;text-decoration:none;font-weight:600}}</style>
+    <script>setTimeout(()=>window.location.href='/',1500)</script>
+    </head><body><div class="card">
+    <div class="check">✓</div>
+    <h2>Authenticated!</h2>
+    <p>Signed in as <span class="email">{email}</span></p>
+    <p style="color:#8888a0;font-size:14px">Redirecting to dashboard...</p>
+    <a class="btn" href="/">Open Dashboard</a>
+    </div></body></html>
+    """)
+
+
+@app.get("/api/auth/url")
+async def get_auth_url():
+    """Returns the platform auth URL for the browser redirect."""
+    auth_url = f"{PROD_BASE}/auth/desktop-callback?port={PORT}"
+    return {"auth_url": auth_url, "platform": PROD_BASE, "port": PORT}
+
+
+@app.get("/api/auth/status")
+async def auth_status():
+    """Check if user is authenticated."""
+    if miner_state["jwt_token"]:
+        return {"authenticated": True, "email": miner_state["user_email"], "miner_id": miner_state["miner_id"]}
+    return {"authenticated": False}
 
 
 @app.post("/api/logout")
