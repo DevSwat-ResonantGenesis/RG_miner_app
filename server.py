@@ -253,7 +253,6 @@ async def start_mining(request: Request):
     body = await request.json()
     cycles = body.get("cycles", 5)
     model_id = body.get("model_id", "resonant-seed-1b")
-    use_real = body.get("real_training", True)
 
     miner_state.update({
         "status": "initializing",
@@ -264,13 +263,13 @@ async def start_mining(request: Request):
         "reward_history": [],
         "training_log": [],
         "model_id": model_id,
-        "real_training": use_real,
+        "real_training": True,
         "start_time": time.time(),
         "error": None,
     })
 
-    _training_task = asyncio.create_task(_mining_loop(cycles, use_real))
-    return {"status": "started", "cycles": cycles, "model_id": model_id, "real_training": use_real}
+    _training_task = asyncio.create_task(_mining_loop(cycles))
+    return {"status": "started", "cycles": cycles, "model_id": model_id}
 
 
 @app.post("/api/mining/stop")
@@ -392,28 +391,6 @@ def _safe_state() -> dict:
     return s
 
 
-def _simulate_training(task: dict, cycle: int) -> dict:
-    """Simulated training fallback."""
-    num_params = 100_000
-    k = 10
-    indices = sorted(random.sample(range(num_params), k))
-    values = [round(random.gauss(0, 0.05), 6) for _ in range(k)]
-    hash_input = json.dumps({"indices": indices, "values": values}, sort_keys=True).encode()
-    gradient_hash = hashlib.sha256(hash_input).hexdigest()
-    base_loss = 11.0 - (cycle * 0.3)
-    loss_before = base_loss + random.uniform(-0.1, 0.1)
-    loss_after = loss_before - random.uniform(0.5, 1.5)
-    return {
-        "top_k_indices": indices, "top_k_values": values,
-        "original_size": num_params, "compressed_size": k,
-        "compression_ratio": num_params / k, "gradient_hash": gradient_hash,
-        "loss_before": round(loss_before, 4), "loss_after": round(max(0.5, loss_after), 4),
-        "samples_processed": task.get("num_samples", 244140),
-        "training_time_seconds": round(random.uniform(20.0, 60.0), 2),
-        "real_training": False,
-    }
-
-
 def _real_training_step(task: dict, cycle: int, model, data, device_str: str):
     """Run actual forward/backward pass. Returns grad_data + model/data refs."""
     import torch
@@ -421,6 +398,15 @@ def _real_training_step(task: dict, cycle: int, model, data, device_str: str):
     from real_trainer import get_tokenizer, DataShardLoader, RealTrainer, compress_gradients
 
     device = torch.device(device_str)
+
+    # Scale parameters for device memory constraints
+    # MPS (MacBook) and CPU: small batch + short seq to avoid OOM
+    if device_str in ("mps", "cpu"):
+        max_seq = 512
+        bs = 1
+    else:
+        max_seq = task.get("max_seq_length", 4096)
+        bs = task.get("batch_size", 8)
 
     # Init model on first call
     if model is None:
@@ -431,13 +417,12 @@ def _real_training_step(task: dict, cycle: int, model, data, device_str: str):
     # Init data on first call
     if data is None:
         tok = get_tokenizer()
-        loader = DataShardLoader(tok, max_seq_length=task.get("max_seq_length", 4096))
+        loader = DataShardLoader(tok, max_seq_length=max_seq)
         try:
-            data = loader.load_from_huggingface(num_samples=max(200, task.get("batch_size", 8) * 20))
+            data = loader.load_from_huggingface(num_samples=max(50, bs * 20))
         except Exception:
-            data = loader._generate_synthetic_data(max(200, task.get("batch_size", 8) * 20))
+            data = loader._generate_synthetic_data(max(50, bs * 20))
 
-    bs = task.get("batch_size", 8)
     lr = task.get("learning_rate", 3e-4)
     start_idx = (cycle * bs) % len(data)
     batch = data[start_idx:start_idx + bs]
@@ -456,7 +441,7 @@ def _real_training_step(task: dict, cycle: int, model, data, device_str: str):
     # Train
     trainer = RealTrainer(model, task, device)
     result = trainer.train_step(input_ids, labels, lr)
-    compressed = compress_gradients(result["gradients"], top_k_ratio=0.01)
+    compressed = compress_gradients(result["gradients"], top_k_ratio=0.0001)
 
     grad_data = {
         "top_k_indices": compressed["top_k_indices"],
@@ -476,7 +461,7 @@ def _real_training_step(task: dict, cycle: int, model, data, device_str: str):
     return grad_data, model, data
 
 
-async def _mining_loop(num_cycles: int, use_real: bool):
+async def _mining_loop(num_cycles: int):
     """Background mining loop — connects to production via WebSocket."""
     try:
         import websockets
@@ -491,11 +476,13 @@ async def _mining_loop(num_cycles: int, use_real: bool):
     email = miner_state["user_email"]
 
     dev, torch_ok, dev_name = _detect_device()
-    if use_real and not torch_ok:
-        use_real = False
-        log_event("PyTorch not available — falling back to simulated training", "warning")
-    miner_state["real_training"] = use_real
-    mode = f"REAL on {dev_name}" if use_real else "SIMULATED"
+    if not torch_ok:
+        log_event("PyTorch not available — cannot mine without GPU training", "error")
+        miner_state["status"] = "error"
+        miner_state["error"] = "PyTorch required for mining"
+        return
+    miner_state["real_training"] = True
+    mode = f"REAL on {dev_name}"
 
     log_event(f"Starting mining: {mode} | Model: {miner_state['model_id']} | {num_cycles} cycles")
     await broadcast({"type": "state", "data": _safe_state()})
@@ -536,121 +523,122 @@ async def _mining_loop(num_cycles: int, use_real: bool):
         except Exception as e:
             log_event(f"Genesis check: {e}", "warning")
 
-        # Phase 3: Mining via WebSocket
+        # Phase 3: Mining cycles (reconnect WS per cycle — server closes after each gradient)
         miner_state["status"] = "training"
         await broadcast({"type": "state", "data": _safe_state()})
-        log_event("Phase 3: Connecting to mining network...")
+        log_event("Phase 3: Starting mining cycles...")
 
         ws_url = f"{MINING_WS_URL}?token={token}"
+        model = None
+        data = None
 
-        async with websockets.connect(ws_url, close_timeout=10, ping_interval=30) as ws:
-            await ws.send(json.dumps({"action": "register", "miner_id": miner_id, "miner_class": "validator_miner", "account_email": email}))
-            welcome = json.loads(await ws.recv())
+        for cycle in range(1, num_cycles + 1):
+            if miner_state["status"] != "training":
+                break
 
-            if welcome.get("event") != "welcome":
-                log_event(f"Registration failed: {welcome}", "error")
-                miner_state["status"] = "error"
-                miner_state["error"] = str(welcome)
-                await broadcast({"type": "state", "data": _safe_state()})
-                return
+            log_event(f"━━━ Cycle {cycle}/{num_cycles} ━━━")
+            await broadcast({"type": "cycle", "current": cycle, "total": num_cycles})
 
-            log_event(f"Connected: {miner_id} | Global step: {welcome.get('param_server', {}).get('global_step', 0)}")
+            try:
+                async with websockets.connect(ws_url, close_timeout=10, ping_interval=None) as ws:
+                    # Register
+                    await ws.send(json.dumps({"action": "register", "miner_id": miner_id, "miner_class": "validator_miner", "account_email": email}))
+                    welcome = json.loads(await ws.recv())
 
-            model = None
-            data = None
+                    if welcome.get("event") != "welcome":
+                        log_event(f"Registration failed: {welcome}", "error")
+                        break
 
-            for cycle in range(1, num_cycles + 1):
-                if miner_state["status"] != "training":
-                    break
+                    if cycle == 1:
+                        log_event(f"Connected: {miner_id} | Global step: {welcome.get('param_server', {}).get('global_step', 0)}")
 
-                log_event(f"━━━ Cycle {cycle}/{num_cycles} ━━━")
-                await broadcast({"type": "cycle", "current": cycle, "total": num_cycles})
+                    # Request task
+                    await ws.send(json.dumps({"action": "request_task"}))
+                    task_msg = json.loads(await ws.recv())
 
-                # Request task
-                await ws.send(json.dumps({"action": "request_task"}))
-                task_msg = json.loads(await ws.recv())
+                    if task_msg.get("event") == "no_tasks":
+                        log_event("No tasks available — queue exhausted", "warning")
+                        break
+                    if task_msg.get("event") != "task_assigned":
+                        log_event(f"Unexpected response: {task_msg}", "error")
+                        break
 
-                if task_msg.get("event") == "no_tasks":
-                    log_event("No tasks available — queue exhausted", "warning")
-                    break
-                if task_msg.get("event") != "task_assigned":
-                    log_event(f"Unexpected response: {task_msg}", "error")
-                    break
+                    task = task_msg["task"]
+                    log_event(f"Task: {task['task_id'][:12]}... | Epoch {task['epoch']} | Batch {task['batch_index']}")
 
-                task = task_msg["task"]
-                log_event(f"Task: {task['task_id'][:12]}... | Epoch {task['epoch']} | Batch {task['batch_index']}")
-
-                # Train
-                train_start = time.time()
-                if use_real:
+                    # Train (real GPU training only — no simulation)
+                    train_start = time.time()
                     log_event(f"Training on {dev_name}...")
                     try:
                         grad_data, model, data = await asyncio.to_thread(
                             _real_training_step, task, cycle, model, data, dev,
                         )
                     except Exception as e:
-                        log_event(f"Real training failed: {e} — falling back to simulation", "error")
-                        grad_data = _simulate_training(task, cycle)
-                else:
-                    grad_data = _simulate_training(task, cycle)
-                    await asyncio.sleep(0.3)
+                        log_event(f"Training failed: {e}", "error")
+                        miner_state["error"] = str(e)
+                        await broadcast({"type": "error", "message": f"Training failed: {e}"})
+                        continue
 
-                elapsed = time.time() - train_start
-                loss_b = grad_data["loss_before"]
-                loss_a = grad_data["loss_after"]
-                miner_state["current_loss"] = loss_a
-                miner_state["loss_history"].append({"cycle": cycle, "loss_before": loss_b, "loss_after": loss_a, "time": elapsed})
+                    elapsed = time.time() - train_start
+                    loss_b = grad_data["loss_before"]
+                    loss_a = grad_data["loss_after"]
+                    miner_state["current_loss"] = loss_a
+                    miner_state["loss_history"].append({"cycle": cycle, "loss_before": loss_b, "loss_after": loss_a, "time": elapsed})
 
-                log_event(f"Loss: {loss_b:.4f} → {loss_a:.4f} (Δ {loss_b - loss_a:.4f}) | {elapsed:.1f}s")
-                log_event(f"Compression: {grad_data['original_size']:,} → {grad_data['compressed_size']:,} ({grad_data['compression_ratio']:.0f}x)")
-                await broadcast({"type": "training", "cycle": cycle, "loss_before": loss_b, "loss_after": loss_a, "elapsed": elapsed})
+                    log_event(f"Loss: {loss_b:.4f} → {loss_a:.4f} (Δ {loss_b - loss_a:.4f}) | {elapsed:.1f}s")
+                    log_event(f"Compression: {grad_data['original_size']:,} → {grad_data['compressed_size']:,} ({grad_data['compression_ratio']:.0f}x)")
+                    await broadcast({"type": "training", "cycle": cycle, "loss_before": loss_b, "loss_after": loss_a, "elapsed": elapsed})
 
-                # Submit gradient
-                sub_id = f"sub-{uuid4().hex[:8]}"
-                await ws.send(json.dumps({
-                    "action": "submit_gradient",
-                    "gradient": {
-                        "submission_id": sub_id, "task_id": task["task_id"],
-                        "model_id": task["model_id"], "epoch": task["epoch"],
-                        "batch_index": task["batch_index"],
-                        "data_shard_hash": task.get("data_shard_hash", ""),
-                        "weight_shard_hash": task.get("weight_shard_hash", ""),
-                        **grad_data,
-                    },
-                }))
+                    # Submit gradient
+                    sub_id = f"sub-{uuid4().hex[:8]}"
+                    await ws.send(json.dumps({
+                        "action": "submit_gradient",
+                        "gradient": {
+                            "submission_id": sub_id, "task_id": task["task_id"],
+                            "model_id": task["model_id"], "epoch": task["epoch"],
+                            "batch_index": task["batch_index"],
+                            "data_shard_hash": task.get("data_shard_hash", ""),
+                            "weight_shard_hash": task.get("weight_shard_hash", ""),
+                            **grad_data,
+                        },
+                    }))
 
-                submit_msg = json.loads(await ws.recv())
-                if submit_msg.get("event") == "gradient_accepted":
-                    reward = submit_msg.get("reward", 0)
-                    miner_state["total_rgt"] += reward
-                    miner_state["cycles_completed"] = cycle
-                    miner_state["reward_history"].append({"cycle": cycle, "reward": reward})
-                    log_event(f"✓ Gradient ACCEPTED — Reward: {reward} $RGT | Total: {miner_state['total_rgt']:.2f} $RGT")
+                    submit_msg = json.loads(await ws.recv())
+                    if submit_msg.get("event") == "gradient_accepted":
+                        reward = submit_msg.get("reward", 0)
+                        miner_state["total_rgt"] += reward
+                        miner_state["cycles_completed"] = cycle
+                        miner_state["reward_history"].append({"cycle": cycle, "reward": reward})
+                        log_event(f"✓ Gradient ACCEPTED — Reward: {reward} $RGT | Total: {miner_state['total_rgt']:.2f} $RGT")
 
-                    try:
-                        agg_raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                        agg = json.loads(agg_raw)
-                        if agg.get("event") == "aggregation_complete":
-                            log_event(f"⚡ Aggregation — global step {agg['global_step']} ({agg['layers_merged']} layers)")
-                    except asyncio.TimeoutError:
-                        pass
+                        try:
+                            agg_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                            agg = json.loads(agg_raw)
+                            if agg.get("event") == "aggregation_complete":
+                                log_event(f"⚡ Aggregation — global step {agg['global_step']} ({agg['layers_merged']} layers)")
+                        except (asyncio.TimeoutError, Exception):
+                            pass
 
-                elif submit_msg.get("event") == "gradient_rejected":
-                    log_event(f"✗ Gradient REJECTED: {submit_msg.get('reason')}", "error")
-                else:
-                    log_event(f"Unexpected: {submit_msg}", "error")
+                    elif submit_msg.get("event") == "gradient_rejected":
+                        log_event(f"✗ Gradient REJECTED: {submit_msg.get('reason')}", "error")
+                    else:
+                        log_event(f"Unexpected: {submit_msg}", "error")
 
-                await broadcast({"type": "state", "data": _safe_state()})
+                    await broadcast({"type": "state", "data": _safe_state()})
 
-                # Heartbeat
-                await ws.send(json.dumps({"action": "heartbeat"}))
-                await ws.recv()
+            except Exception as e:
+                log_event(f"Cycle {cycle} connection error: {e}", "warning")
 
-            # Done
-            log_event(f"Mining complete: {miner_state['cycles_completed']}/{num_cycles} cycles | {miner_state['total_rgt']:.2f} $RGT earned")
-            miner_state["status"] = "idle"
-            await broadcast({"type": "state", "data": _safe_state()})
-            await broadcast({"type": "complete", "cycles": miner_state["cycles_completed"], "rgt": miner_state["total_rgt"]})
+            # Pause between cycles — mining service needs time to finish aggregation
+            if cycle < num_cycles:
+                log_event("Waiting for aggregation to complete...")
+                await asyncio.sleep(10)
+
+        # Done
+        log_event(f"Mining complete: {miner_state['cycles_completed']}/{num_cycles} cycles | {miner_state['total_rgt']:.2f} $RGT earned")
+        miner_state["status"] = "idle"
+        await broadcast({"type": "state", "data": _safe_state()})
+        await broadcast({"type": "complete", "cycles": miner_state["cycles_completed"], "rgt": miner_state["total_rgt"]})
 
     except asyncio.CancelledError:
         log_event("Mining cancelled", "warning")

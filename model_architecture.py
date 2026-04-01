@@ -144,10 +144,8 @@ class GroupedQueryAttention(nn.Module):
         k = self.k_proj(x).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = self.v_proj(x).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
-        # Apply RoPE to Q and K
-        q, k = apply_rope(q.transpose(1, 2), k.transpose(1, 2), freqs_cis)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
+        # Apply RoPE to Q and K (in seqlen-major layout before transposing)
+        q, k = apply_rope(q, k, freqs_cis)
 
         # Expand KV heads to match query heads (GQA)
         if self.num_groups > 1:
@@ -354,22 +352,22 @@ def create_model(model_id: str, registry: dict = None) -> Tuple[ResonantModel, R
         # Inline registry for standalone miner app (no genesis_seed module)
         registry = {
             "resonant-seed-1b": {
-                "d_model": 2048, "num_layers": 24, "num_heads": 16,
-                "num_kv_heads": 4, "d_ff": 5504, "vocab_size": 100277,
+                "hidden_size": 2048, "num_layers": 24, "num_heads": 16,
+                "num_kv_heads": 4, "intermediate_size": 5504, "vocab_size": 100277,
                 "max_seq_length": 4096, "dropout": 0.0, "rope_theta": 10000.0,
                 "description": "1B param seed model", "parameters": "~1B",
                 "min_miners": 1,
             },
             "resonant-v1-7b": {
-                "d_model": 4096, "num_layers": 32, "num_heads": 32,
-                "num_kv_heads": 8, "d_ff": 11008, "vocab_size": 100277,
+                "hidden_size": 4096, "num_layers": 32, "num_heads": 32,
+                "num_kv_heads": 8, "intermediate_size": 11008, "vocab_size": 100277,
                 "max_seq_length": 8192, "dropout": 0.0, "rope_theta": 10000.0,
                 "description": "7B param v1 model", "parameters": "~7B",
                 "min_miners": 4,
             },
             "resonant-v1-13b": {
-                "d_model": 5120, "num_layers": 40, "num_heads": 40,
-                "num_kv_heads": 8, "d_ff": 13824, "vocab_size": 100277,
+                "hidden_size": 5120, "num_layers": 40, "num_heads": 40,
+                "num_kv_heads": 8, "intermediate_size": 13824, "vocab_size": 100277,
                 "max_seq_length": 8192, "dropout": 0.0, "rope_theta": 10000.0,
                 "description": "13B param v1 model", "parameters": "~13B",
                 "min_miners": 8,

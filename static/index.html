@@ -210,11 +210,7 @@ a { color: var(--accent2); text-decoration: none; }
             <label style="font-size:11px;color:var(--text2)">Cycles</label>
             <input type="number" id="ctl-cycles" value="5" min="1" max="100" style="width:80px">
           </div>
-          <label class="toggle">
-            <input type="checkbox" id="ctl-real" checked>
-            <div class="slider"></div>
-            Real Training (GPU)
-          </label>
+          <span style="font-size:13px;color:var(--accent)">&#9679; Real Training (GPU)</span>
           <button class="btn btn-success" id="btn-start" onclick="startMining()">&#9654; Start Mining</button>
           <button class="btn btn-danger" id="btn-stop" onclick="stopMining()" style="display:none">&#9632; Stop</button>
         </div>
@@ -458,9 +454,8 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
 async function startMining() {
   const model_id = document.getElementById('ctl-model').value;
   const cycles = parseInt(document.getElementById('ctl-cycles').value) || 5;
-  const real_training = document.getElementById('ctl-real').checked;
   document.getElementById('log-panel').innerHTML = '';
-  const r = await fetch('/api/mining/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model_id, cycles, real_training}) });
+  const r = await fetch('/api/mining/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model_id, cycles}) });
   if (!r.ok) {
     const d = await r.json();
     addLog({ts: new Date().toISOString(), level: 'error', msg: d.detail || 'Failed to start'});
