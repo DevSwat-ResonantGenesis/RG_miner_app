@@ -351,8 +351,30 @@ def create_model(model_id: str, registry: dict = None) -> Tuple[ResonantModel, R
         (model, config) tuple
     """
     if registry is None:
-        from .genesis_seed import MODEL_REGISTRY
-        registry = MODEL_REGISTRY
+        # Inline registry for standalone miner app (no genesis_seed module)
+        registry = {
+            "resonant-seed-1b": {
+                "d_model": 2048, "num_layers": 24, "num_heads": 16,
+                "num_kv_heads": 4, "d_ff": 5504, "vocab_size": 100277,
+                "max_seq_length": 4096, "dropout": 0.0, "rope_theta": 10000.0,
+                "description": "1B param seed model", "parameters": "~1B",
+                "min_miners": 1,
+            },
+            "resonant-v1-7b": {
+                "d_model": 4096, "num_layers": 32, "num_heads": 32,
+                "num_kv_heads": 8, "d_ff": 11008, "vocab_size": 100277,
+                "max_seq_length": 8192, "dropout": 0.0, "rope_theta": 10000.0,
+                "description": "7B param v1 model", "parameters": "~7B",
+                "min_miners": 4,
+            },
+            "resonant-v1-13b": {
+                "d_model": 5120, "num_layers": 40, "num_heads": 40,
+                "num_kv_heads": 8, "d_ff": 13824, "vocab_size": 100277,
+                "max_seq_length": 8192, "dropout": 0.0, "rope_theta": 10000.0,
+                "description": "13B param v1 model", "parameters": "~13B",
+                "min_miners": 8,
+            },
+        }
 
     if model_id not in registry:
         raise ValueError(f"Unknown model: {model_id}. Available: {list(registry.keys())}")
