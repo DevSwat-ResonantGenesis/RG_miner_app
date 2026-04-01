@@ -162,21 +162,34 @@ async def auth_callback(request: Request):
     if not token:
         return HTMLResponse(content="<h2>Authentication failed</h2><p>No token received. <a href='/'>Try again</a></p>", status_code=400)
 
-    # Decode JWT to get user info (no verification needed — platform already verified)
+    # Fetch real user info from platform — same as Resonant IDE (GET /api/v1/auth/verify)
+    email = ""
+    user_id = ""
+    user_name = ""
     try:
-        import base64
-        payload_b64 = token.split(".")[1]
-        payload_b64 += "=" * (4 - len(payload_b64) % 4)
-        payload = json.loads(base64.b64decode(payload_b64))
-        email = payload.get("email", "miner@resonantgenesis.com")
-        user_id = payload.get("user_id", "")
-    except Exception:
-        email = "miner@resonantgenesis.com"
-        user_id = ""
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{PROD_BASE}/api/v1/auth/verify",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                email = data.get("email", "")
+                user_id = data.get("user_id", data.get("id", ""))
+                user_name = data.get("full_name", data.get("name", ""))
+                logger.info(f"Verified user: {email} ({user_name})")
+            else:
+                logger.warning(f"Auth verify returned {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"Auth verify failed: {e}")
+
+    if not email:
+        email = "user@resonantgenesis.com"
 
     miner_state["jwt_token"] = token
     miner_state["user_email"] = email
     miner_state["user_id"] = user_id
+    miner_state["user_name"] = user_name
     miner_state["miner_id"] = f"miner-{email.split('@')[0]}-{uuid4().hex[:6]}"
     miner_state["error"] = None
 
