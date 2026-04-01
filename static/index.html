@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RG Miner — ResonantGenesis Network</title>
+<style>
+:root {
+  --bg: #0a0a0f;
+  --surface: #12121a;
+  --surface2: #1a1a2e;
+  --border: #2a2a3e;
+  --accent: #6c5ce7;
+  --accent2: #a29bfe;
+  --green: #00e676;
+  --red: #ff5252;
+  --yellow: #ffd740;
+  --text: #e0e0e8;
+  --text2: #8888a0;
+  --radius: 12px;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; min-height: 100vh; }
+a { color: var(--accent2); text-decoration: none; }
+
+/* Layout */
+.app { display: flex; flex-direction: column; min-height: 100vh; }
+.header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; }
+.header h1 { font-size: 18px; font-weight: 700; }
+.header h1 span { color: var(--accent2); }
+.header .user-info { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--text2); }
+.header .user-info .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text2); }
+.header .user-info .dot.online { background: var(--green); }
+.header .user-info .dot.training { background: var(--yellow); animation: pulse 1s infinite; }
+.header .btn-sm { padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); background: transparent; color: var(--text2); cursor: pointer; font-size: 12px; }
+.header .btn-sm:hover { border-color: var(--accent); color: var(--text); }
+.main { flex: 1; padding: 24px; max-width: 1400px; margin: 0 auto; width: 100%; }
+
+/* Login */
+.login-page { display: flex; align-items: center; justify-content: center; flex: 1; padding: 24px; }
+.login-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 40px; width: 420px; max-width: 100%; }
+.login-card h2 { font-size: 24px; margin-bottom: 8px; }
+.login-card p { color: var(--text2); font-size: 14px; margin-bottom: 24px; }
+.login-card .logo { font-size: 36px; margin-bottom: 16px; }
+.form-group { margin-bottom: 16px; }
+.form-group label { display: block; font-size: 12px; color: var(--text2); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+.form-group input { width: 100%; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 14px; outline: none; }
+.form-group input:focus { border-color: var(--accent); }
+.btn { padding: 12px 24px; border-radius: 8px; border: none; font-size: 14px; font-weight: 600; cursor: pointer; width: 100%; transition: all 0.2s; }
+.btn-primary { background: var(--accent); color: white; }
+.btn-primary:hover { background: var(--accent2); }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text); }
+.btn-outline:hover { border-color: var(--accent); }
+.btn-danger { background: var(--red); color: white; }
+.btn-success { background: var(--green); color: #111; }
+.error-msg { color: var(--red); font-size: 13px; margin-top: 8px; }
+.login-footer { margin-top: 16px; text-align: center; font-size: 12px; color: var(--text2); }
+.divider { border-top: 1px solid var(--border); margin: 20px 0; }
+
+/* Cards */
+.grid { display: grid; gap: 16px; }
+.grid-2 { grid-template-columns: 1fr 1fr; }
+.grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+.grid-4 { grid-template-columns: 1fr 1fr 1fr 1fr; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
+.card h3 { font-size: 13px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
+.stat-value { font-size: 28px; font-weight: 700; }
+.stat-value.green { color: var(--green); }
+.stat-value.accent { color: var(--accent2); }
+.stat-value.yellow { color: var(--yellow); }
+.stat-label { font-size: 12px; color: var(--text2); margin-top: 4px; }
+
+/* Mining controls */
+.controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.controls select, .controls input[type=number] { padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 14px; outline: none; }
+.controls select:focus, .controls input:focus { border-color: var(--accent); }
+.controls .btn { width: auto; padding: 10px 24px; }
+.toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+.toggle input { display: none; }
+.toggle .slider { width: 36px; height: 20px; background: var(--border); border-radius: 10px; position: relative; transition: 0.2s; }
+.toggle .slider::after { content: ''; width: 16px; height: 16px; background: var(--text2); border-radius: 50%; position: absolute; top: 2px; left: 2px; transition: 0.2s; }
+.toggle input:checked + .slider { background: var(--accent); }
+.toggle input:checked + .slider::after { left: 18px; background: white; }
+
+/* Log panel */
+.log-panel { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); height: 300px; overflow-y: auto; font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 12px; padding: 12px; }
+.log-entry { padding: 2px 0; line-height: 1.6; }
+.log-entry .ts { color: var(--text2); }
+.log-entry.info .msg { color: var(--text); }
+.log-entry.warning .msg { color: var(--yellow); }
+.log-entry.error .msg { color: var(--red); }
+
+/* Loss chart */
+.chart-container { position: relative; height: 200px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.chart-canvas { width: 100%; height: 100%; }
+
+/* Status badge */
+.badge { display: inline-block; padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+.badge.idle { background: rgba(136,136,160,0.15); color: var(--text2); }
+.badge.initializing { background: rgba(255,215,64,0.15); color: var(--yellow); }
+.badge.training { background: rgba(0,230,118,0.15); color: var(--green); }
+.badge.error { background: rgba(255,82,82,0.15); color: var(--red); }
+
+/* Network status dots */
+.net-status { display: flex; gap: 16px; }
+.net-item { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.net-dot { width: 8px; height: 8px; border-radius: 50%; }
+.net-dot.ok { background: var(--green); }
+.net-dot.err { background: var(--red); }
+.net-dot.loading { background: var(--yellow); animation: pulse 1s infinite; }
+
+/* Models table */
+.model-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.model-table th { text-align: left; padding: 8px 12px; color: var(--text2); font-size: 11px; text-transform: uppercase; border-bottom: 1px solid var(--border); }
+.model-table td { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.model-table tr:hover { background: rgba(108,92,231,0.05); }
+
+/* Tabs */
+.tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
+.tab { padding: 10px 20px; font-size: 13px; cursor: pointer; color: var(--text2); border-bottom: 2px solid transparent; transition: 0.2s; }
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--accent2); border-bottom-color: var(--accent); }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+@media (max-width: 900px) { .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="app" id="app">
+
+  <!-- LOGIN PAGE -->
+  <div id="login-page" class="login-page">
+    <div class="login-card">
+      <div class="logo">⛏️</div>
+      <h2>RG Miner</h2>
+      <p>Login with your ResonantGenesis account to start mining and earn $RGT tokens.</p>
+
+      <div class="form-group">
+        <label>Email</label>
+        <input type="email" id="login-email" placeholder="you@example.com" autocomplete="email">
+      </div>
+      <div class="form-group">
+        <label>Password</label>
+        <input type="password" id="login-password" placeholder="Your password" autocomplete="current-password">
+      </div>
+      <button class="btn btn-primary" id="btn-login" onclick="doLogin()">Sign In & Start Mining</button>
+      <div id="login-error" class="error-msg" style="display:none"></div>
+
+      <div class="divider"></div>
+      <p style="font-size:12px;color:var(--text2);margin-bottom:8px;">Or use a JWT token directly:</p>
+      <div class="form-group">
+        <input type="text" id="login-token" placeholder="Paste JWT token here...">
+      </div>
+      <button class="btn btn-outline" onclick="doTokenLogin()">Login with Token</button>
+
+      <div class="login-footer">
+        <div id="sys-info" style="margin-top:12px;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- DASHBOARD PAGE -->
+  <div id="dashboard-page" style="display:none">
+    <div class="header">
+      <h1>⛏️ <span>RG Miner</span></h1>
+      <div class="user-info">
+        <div id="net-indicators" class="net-status"></div>
+        <div class="dot" id="status-dot"></div>
+        <span id="status-text">Idle</span>
+        <span id="user-email" style="color:var(--accent2)"></span>
+        <button class="btn-sm" onclick="doLogout()">Logout</button>
+      </div>
+    </div>
+
+    <div class="main">
+      <!-- Stats row -->
+      <div class="grid grid-4" style="margin-bottom:20px">
+        <div class="card">
+          <h3>Status</h3>
+          <span class="badge idle" id="badge-status">IDLE</span>
+          <div class="stat-label" id="device-label"></div>
+        </div>
+        <div class="card">
+          <h3>$RGT Earned</h3>
+          <div class="stat-value green" id="stat-rgt">0.00</div>
+          <div class="stat-label" id="stat-cycles">0 / 0 cycles</div>
+        </div>
+        <div class="card">
+          <h3>Current Loss</h3>
+          <div class="stat-value accent" id="stat-loss">—</div>
+          <div class="stat-label" id="stat-loss-delta"></div>
+        </div>
+        <div class="card">
+          <h3>Model</h3>
+          <div class="stat-value" id="stat-model" style="font-size:16px;margin-top:8px;">resonant-seed-1b</div>
+          <div class="stat-label" id="stat-params"></div>
+        </div>
+      </div>
+
+      <!-- Controls -->
+      <div class="card" style="margin-bottom:20px">
+        <h3>Mining Controls</h3>
+        <div class="controls">
+          <select id="ctl-model">
+            <option value="resonant-seed-1b">Seed 1B</option>
+            <option value="resonant-v1-7b">V1 7B</option>
+            <option value="resonant-v1-13b">V1 13B</option>
+          </select>
+          <div>
+            <label style="font-size:11px;color:var(--text2)">Cycles</label>
+            <input type="number" id="ctl-cycles" value="5" min="1" max="100" style="width:80px">
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="ctl-real" checked>
+            <div class="slider"></div>
+            Real Training (GPU)
+          </label>
+          <button class="btn btn-success" id="btn-start" onclick="startMining()">▶ Start Mining</button>
+          <button class="btn btn-danger" id="btn-stop" onclick="stopMining()" style="display:none">■ Stop</button>
+        </div>
+      </div>
+
+      <!-- Tabs -->
+      <div class="tabs">
+        <div class="tab active" data-tab="log" onclick="switchTab('log')">Training Log</div>
+        <div class="tab" data-tab="chart" onclick="switchTab('chart')">Loss Chart</div>
+        <div class="tab" data-tab="models" onclick="switchTab('models')">Model Registry</div>
+        <div class="tab" data-tab="network" onclick="switchTab('network')">Network</div>
+      </div>
+
+      <div id="tab-log" class="tab-content active">
+        <div class="log-panel" id="log-panel"></div>
+      </div>
+
+      <div id="tab-chart" class="tab-content">
+        <div class="card">
+          <h3>Loss Over Training Cycles</h3>
+          <div class="chart-container">
+            <canvas id="loss-canvas" class="chart-canvas"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <div id="tab-models" class="tab-content">
+        <div class="card">
+          <h3>Model Registry</h3>
+          <table class="model-table" id="model-table">
+            <thead><tr><th>Model</th><th>Parameters</th><th>Layers</th><th>Heads</th><th>Context</th><th>Min Miners</th></tr></thead>
+            <tbody id="model-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="tab-network" class="tab-content">
+        <div class="grid grid-3" id="network-cards"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';  // Same origin
+let ws = null;
+let state = {};
+
+// ── System info on login page ──
+async function loadSysInfo() {
+  try {
+    const r = await fetch('/api/system/info');
+    const d = await r.json();
+    document.getElementById('sys-info').innerHTML =
+      `<span style="color:var(--accent2)">${d.device_name}</span> · PyTorch ${d.pytorch_available ? d.pytorch_version : '<span style="color:var(--red)">not installed</span>'} · Platform: ${d.platform_url}`;
+  } catch(e) {}
+}
+loadSysInfo();
+
+// ── Login ──
+async function doLogin() {
+  const email = document.getElementById('login-email').value;
+  const password = document.getElementById('login-password').value;
+  const btn = document.getElementById('btn-login');
+  const errEl = document.getElementById('login-error');
+  errEl.style.display = 'none';
+  btn.disabled = true; btn.textContent = 'Signing in...';
+
+  try {
+    const r = await fetch('/api/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({email, password}) });
+    const d = await r.json();
+    if (d.success) {
+      showDashboard(d);
+    } else {
+      errEl.textContent = d.error || 'Login failed';
+      errEl.style.display = 'block';
+    }
+  } catch(e) {
+    errEl.textContent = 'Connection error: ' + e.message;
+    errEl.style.display = 'block';
+  }
+  btn.disabled = false; btn.textContent = 'Sign In & Start Mining';
+}
+
+async function doTokenLogin() {
+  const token = document.getElementById('login-token').value.trim();
+  const email = document.getElementById('login-email').value || 'user@resonantgenesis.com';
+  if (!token) return;
+  const errEl = document.getElementById('login-error');
+  try {
+    const r = await fetch('/api/login-token', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({token, email}) });
+    const d = await r.json();
+    if (d.success) showDashboard(d);
+    else { errEl.textContent = d.error; errEl.style.display = 'block'; }
+  } catch(e) { errEl.textContent = e.message; errEl.style.display = 'block'; }
+}
+
+document.getElementById('login-password').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
+// ── Dashboard ──
+function showDashboard(data) {
+  document.getElementById('login-page').style.display = 'none';
+  document.getElementById('dashboard-page').style.display = 'flex';
+  document.getElementById('dashboard-page').style.flexDirection = 'column';
+  document.getElementById('dashboard-page').style.minHeight = '100vh';
+  document.getElementById('user-email').textContent = data.email;
+  document.getElementById('device-label').textContent = data.device || '';
+  connectWS();
+  loadModels();
+  loadNetworkHealth();
+}
+
+async function doLogout() {
+  if (ws) ws.close();
+  await fetch('/api/logout', {method:'POST'});
+  document.getElementById('dashboard-page').style.display = 'none';
+  document.getElementById('login-page').style.display = 'flex';
+}
+
+// ── WebSocket ──
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'state') { state = msg.data; updateUI(); }
+    else if (msg.type === 'log') addLog(msg);
+    else if (msg.type === 'training') updateTraining(msg);
+    else if (msg.type === 'cycle') updateCycle(msg);
+    else if (msg.type === 'complete') onComplete(msg);
+  };
+  ws.onclose = () => setTimeout(connectWS, 3000);
+}
+
+// ── UI Updates ──
+function updateUI() {
+  const s = state;
+  // Status badge
+  const badge = document.getElementById('badge-status');
+  badge.textContent = (s.status || 'idle').toUpperCase();
+  badge.className = 'badge ' + (s.status || 'idle');
+
+  // Status dot
+  const dot = document.getElementById('status-dot');
+  dot.className = 'dot' + (s.status === 'training' ? ' training' : s.status === 'idle' ? '' : ' online');
+  document.getElementById('status-text').textContent = s.status === 'training' ? 'Mining' : s.status === 'initializing' ? 'Initializing...' : 'Idle';
+
+  // Stats
+  document.getElementById('stat-rgt').textContent = (s.total_rgt || 0).toFixed(2);
+  document.getElementById('stat-cycles').textContent = `${s.cycles_completed || 0} / ${s.cycles_target || 0} cycles`;
+  document.getElementById('stat-loss').textContent = s.current_loss != null ? s.current_loss.toFixed(4) : '—';
+  document.getElementById('stat-model').textContent = s.model_id || 'resonant-seed-1b';
+
+  // Buttons
+  const isTraining = s.status === 'training' || s.status === 'initializing';
+  document.getElementById('btn-start').style.display = isTraining ? 'none' : '';
+  document.getElementById('btn-stop').style.display = isTraining ? '' : 'none';
+
+  // Loss delta
+  const lh = s.loss_history || [];
+  if (lh.length >= 2) {
+    const prev = lh[lh.length-2].loss_after;
+    const curr = lh[lh.length-1].loss_after;
+    const delta = prev - curr;
+    document.getElementById('stat-loss-delta').textContent = `Δ ${delta > 0 ? '-' : '+'}${Math.abs(delta).toFixed(4)} from last cycle`;
+  }
+
+  drawChart(lh);
+}
+
+function addLog(msg) {
+  const panel = document.getElementById('log-panel');
+  const div = document.createElement('div');
+  div.className = 'log-entry ' + msg.level;
+  const ts = new Date(msg.ts).toLocaleTimeString();
+  div.innerHTML = `<span class="ts">${ts}</span> <span class="msg">${escHtml(msg.msg)}</span>`;
+  panel.appendChild(div);
+  panel.scrollTop = panel.scrollHeight;
+}
+
+function updateTraining(msg) {
+  // Also captured via state updates
+}
+
+function updateCycle(msg) {
+  document.getElementById('stat-cycles').textContent = `${msg.current} / ${msg.total} cycles`;
+}
+
+function onComplete(msg) {
+  addLog({ts: new Date().toISOString(), level: 'info', msg: `✅ Mining complete! ${msg.cycles} cycles — ${msg.rgt.toFixed(2)} $RGT earned`});
+}
+
+function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// ── Mining controls ──
+async function startMining() {
+  const model_id = document.getElementById('ctl-model').value;
+  const cycles = parseInt(document.getElementById('ctl-cycles').value) || 5;
+  const real_training = document.getElementById('ctl-real').checked;
+
+  document.getElementById('log-panel').innerHTML = '';
+  const r = await fetch('/api/mining/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model_id, cycles, real_training}) });
+  if (!r.ok) {
+    const d = await r.json();
+    addLog({ts: new Date().toISOString(), level: 'error', msg: d.detail || 'Failed to start'});
+  }
+}
+
+async function stopMining() {
+  await fetch('/api/mining/stop', {method:'POST'});
+}
+
+// ── Loss chart (canvas) ──
+function drawChart(history) {
+  const canvas = document.getElementById('loss-canvas');
+  if (!canvas || !history || history.length < 1) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.parentElement.clientWidth;
+  const H = canvas.parentElement.clientHeight;
+  canvas.width = W; canvas.height = H;
+
+  ctx.clearRect(0, 0, W, H);
+
+  const pad = {t:20, r:20, b:30, l:50};
+  const cw = W - pad.l - pad.r;
+  const ch = H - pad.t - pad.b;
+
+  const losses = history.map(h => h.loss_after);
+  const lossesBefore = history.map(h => h.loss_before);
+  const allVals = [...losses, ...lossesBefore];
+  const minL = Math.min(...allVals) * 0.95;
+  const maxL = Math.max(...allVals) * 1.05;
+
+  // Grid
+  ctx.strokeStyle = '#1a1a2e';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + (ch * i / 4);
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
+    ctx.fillStyle = '#8888a0';
+    ctx.font = '10px monospace';
+    ctx.fillText((maxL - (maxL-minL)*i/4).toFixed(2), 4, y + 4);
+  }
+
+  // X labels
+  for (let i = 0; i < losses.length; i++) {
+    const x = pad.l + (cw * i / Math.max(1, losses.length - 1));
+    ctx.fillStyle = '#8888a0';
+    ctx.font = '10px monospace';
+    ctx.fillText(i+1, x-4, H-6);
+  }
+
+  function plotLine(vals, color, width) {
+    if (vals.length < 2) return;
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.lineJoin = 'round';
+    for (let i = 0; i < vals.length; i++) {
+      const x = pad.l + (cw * i / Math.max(1, vals.length - 1));
+      const y = pad.t + ch - (ch * (vals[i] - minL) / (maxL - minL));
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  plotLine(lossesBefore, 'rgba(162,155,254,0.3)', 1);
+  plotLine(losses, '#6c5ce7', 2);
+
+  // Dots
+  losses.forEach((v, i) => {
+    const x = pad.l + (cw * i / Math.max(1, losses.length - 1));
+    const y = pad.t + ch - (ch * (v - minL) / (maxL - minL));
+    ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI*2); ctx.fillStyle = '#6c5ce7'; ctx.fill();
+    ctx.beginPath(); ctx.arc(x, y, 2, 0, Math.PI*2); ctx.fillStyle = 'white'; ctx.fill();
+  });
+}
+
+// ── Models ──
+async function loadModels() {
+  try {
+    const r = await fetch('/api/models');
+    const d = await r.json();
+    const models = d.models || d || [];
+    const tbody = document.getElementById('model-tbody');
+    tbody.innerHTML = '';
+    if (Array.isArray(models)) {
+      models.forEach(m => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td style="font-weight:600;color:var(--accent2)">${m.model_id || m.name}</td><td>${formatNum(m.params_billions || m.total_params)}B</td><td>${m.num_layers || m.layers || '—'}</td><td>${m.num_heads || m.heads || '—'}</td><td>${m.max_seq_length || m.context || '—'}</td><td>${m.min_miners || '—'}</td>`;
+        tbody.appendChild(tr);
+      });
+    }
+  } catch(e) {}
+}
+
+// ── Network ──
+async function loadNetworkHealth() {
+  const el = document.getElementById('network-cards');
+  const ind = document.getElementById('net-indicators');
+  el.innerHTML = '<div class="card"><h3>Loading...</h3></div>';
+  try {
+    const r = await fetch('/api/network/health');
+    const d = await r.json();
+    el.innerHTML = '';
+    ind.innerHTML = '';
+    for (const [name, info] of Object.entries(d)) {
+      const ok = info.status === 'ok' || info.service;
+      el.innerHTML += `<div class="card"><h3>${name}</h3><div class="stat-value" style="font-size:16px;color:${ok ? 'var(--green)' : 'var(--red)'}">${ok ? 'Online' : 'Offline'}</div><pre style="font-size:11px;color:var(--text2);margin-top:8px;overflow:auto;max-height:120px">${JSON.stringify(info, null, 2)}</pre></div>`;
+      ind.innerHTML += `<div class="net-item"><div class="net-dot ${ok?'ok':'err'}"></div>${name}</div>`;
+    }
+  } catch(e) {
+    el.innerHTML = `<div class="card"><h3>Error</h3><p style="color:var(--red)">${e.message}</p></div>`;
+  }
+}
+
+// ── Tabs ──
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.toggle('active', t.id === 'tab-'+name));
+  if (name === 'network') loadNetworkHealth();
+  if (name === 'chart') drawChart(state.loss_history || []);
+}
+
+function formatNum(n) { return n ? (n >= 1e9 ? (n/1e9).toFixed(0) : n >= 1e6 ? (n/1e6).toFixed(0)+'M' : n) : n; }
+
+// ── Keyboard shortcut ──
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && e.ctrlKey && document.getElementById('dashboard-page').style.display !== 'none') {
+    if (state.status === 'training') stopMining(); else startMining();
+  }
+});
+</script>
+</body>
+</html>
