@@ -169,7 +169,7 @@ async def auth_callback(request: Request):
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                f"{PROD_BASE}/api/v1/auth/verify",
+                f"{PROD_BASE}/auth/me",
                 headers={"Authorization": f"Bearer {token}"},
             )
             if resp.status_code == 200:
