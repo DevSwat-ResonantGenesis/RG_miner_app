@@ -271,6 +271,13 @@ miner_state = {
     "real_training": False,
     "start_time": None,
     "error": None,
+    # ── Shard state ──
+    "shard_assignment": None,   # ShardAssignment dict from server (layer_start, layer_end, etc.)
+    "pipeline_group_id": None,
+    "stage_index": None,
+    "is_sharded": False,
+    "upstream_peer": None,      # Miner ID of upstream peer (sends activations to us)
+    "downstream_peer": None,    # Miner ID of downstream peer (we send activations to)
 }
 
 _training_task: Optional[asyncio.Task] = None
@@ -278,6 +285,8 @@ _ws_clients: set = set()
 _session_token: Optional[str] = None  # Random token set on auth, checked via cookie
 _csrf_token: Optional[str] = None  # CSRF token, regenerated per session
 _model_ref = None  # Persistent model reference for download
+_activation_buffer = {}  # transfer_id → {chunks: [...], metadata: {...}} for P2P receive
+_peer_addresses = {}  # miner_id → "http://host:port" for P2P activation routing
 
 
 # ── Helpers ──
@@ -323,6 +332,178 @@ def _detect_device():
         return "cpu", True, "CPU"
     except ImportError:
         return "cpu", False, "CPU (PyTorch not installed)"
+
+
+# ══════════════════════════════════════════════════════════════
+# SHARD HELPERS — Pipeline-parallel model loading
+# ══════════════════════════════════════════════════════════════
+
+def _get_gpu_capability() -> dict:
+    """Detect GPU hardware for shard capability registration."""
+    try:
+        import torch
+        import psutil
+    except ImportError:
+        psutil = None
+
+    cap = {
+        "gpu_model": "",
+        "gpu_vram_gb": 0.0,
+        "system_ram_gb": 0.0,
+        "cpu_cores": os.cpu_count() or 1,
+        "bandwidth_mbps": 1000.0,  # Default — real measurement TBD
+        "storage_available_gb": 0.0,
+        "location_region": "unknown",
+        "supported_dtypes": ["fp32"],
+    }
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            cap["gpu_model"] = props.name
+            cap["gpu_vram_gb"] = round(props.total_mem / 1e9, 1)
+            cap["supported_dtypes"] = ["fp32", "fp16", "bf16"]
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            cap["gpu_model"] = "Apple Silicon (MPS)"
+            # MPS doesn't expose VRAM — estimate from system RAM
+            cap["gpu_vram_gb"] = 8.0  # Conservative
+            cap["supported_dtypes"] = ["fp32", "fp16"]
+    except Exception:
+        pass
+
+    if psutil:
+        try:
+            cap["system_ram_gb"] = round(psutil.virtual_memory().total / 1e9, 1)
+            cap["storage_available_gb"] = round(psutil.disk_usage("/").free / 1e9, 1)
+        except Exception:
+            pass
+
+    return cap
+
+
+async def _register_capability(miner_id: str, token: str) -> bool:
+    """Register this miner's hardware capabilities with the mining server."""
+    urls = _platform_urls()
+    cap = _get_gpu_capability()
+    payload = {"miner_id": miner_id, **cap}
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{urls['mining']}/mining/shards/register-capability",
+                headers={"Authorization": f"Bearer {token}"},
+                json=payload,
+            )
+            if resp.status_code == 200:
+                log_event(f"Shard capability registered: {cap['gpu_model']} ({cap['gpu_vram_gb']} GB VRAM)")
+                return True
+            else:
+                log_event(f"Shard capability registration: HTTP {resp.status_code}", "warning")
+    except Exception as e:
+        log_event(f"Shard capability registration failed: {e}", "warning")
+    return False
+
+
+async def _fetch_shard_assignment(miner_id: str, token: str) -> Optional[dict]:
+    """Fetch this miner's shard assignment from the mining server."""
+    urls = _platform_urls()
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{urls['mining']}/mining/shards/assignment/{miner_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if resp.status_code == 200:
+                assignment = resp.json()
+                log_event(
+                    f"Shard assigned: stage {assignment['stage_index']}/{assignment['num_stages']} | "
+                    f"layers {assignment['layer_start']}-{assignment['layer_end']} | "
+                    f"group {assignment['pipeline_group_id'][:12]}..."
+                )
+                return assignment
+            elif resp.status_code == 404:
+                return None  # No assignment yet — full model training
+            else:
+                log_event(f"Shard assignment check: HTTP {resp.status_code}", "warning")
+    except Exception as e:
+        log_event(f"Shard assignment check failed: {e}", "warning")
+    return None
+
+
+async def _fetch_pipeline_peers(miner_id: str, token: str) -> dict:
+    """Fetch upstream/downstream peers for P2P activation routing."""
+    urls = _platform_urls()
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{urls['mining']}/mining/shards/pipeline-peers/{miner_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if resp.status_code == 200:
+                return resp.json()
+    except Exception:
+        pass
+    return {"peers": [], "upstream": None, "downstream": None}
+
+
+async def _report_shard_ready(miner_id: str, token: str) -> bool:
+    """Tell the server this miner has loaded its shard and is ready."""
+    urls = _platform_urls()
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{urls['mining']}/mining/shards/report-ready/{miner_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _create_model_or_shard(task: dict, assignment: Optional[dict], device_str: str):
+    """
+    Create either a full model or a ModelShard depending on assignment.
+    
+    If assignment is None: creates full model (original behavior).
+    If assignment is set: creates only our pipeline shard (partial model).
+    """
+    import torch
+
+    if assignment is None:
+        # Original full-model path
+        from model_architecture import create_model
+        model_id = task.get("model_id", "resonant-seed-1b")
+        model, _ = create_model(model_id)
+        return model.to(torch.device(device_str))
+
+    # Shard path — only load our layers
+    from moe_architecture import create_model_shard
+    model_id = task.get("model_id", assignment.get("model_id", "resonant-seed-1b"))
+    layer_start = assignment["layer_start"]
+    layer_end = assignment["layer_end"]
+    has_embedding = assignment.get("has_embedding", False)
+    has_lm_head = assignment.get("has_lm_head", False)
+
+    shard, config = create_model_shard(
+        model_id=model_id,
+        layer_start=layer_start,
+        layer_end=layer_end,
+        has_embedding=has_embedding,
+        has_lm_head=has_lm_head,
+    )
+
+    device = torch.device(device_str)
+    shard = shard.to(device)
+
+    num_params = sum(p.numel() for p in shard.parameters())
+    size_mb = num_params * 2 / 1e6  # fp16
+    logger.info(
+        f"ModelShard loaded: layers {layer_start}-{layer_end} | "
+        f"{num_params:,} params ({size_mb:.0f} MB) | "
+        f"embed={has_embedding} lm_head={has_lm_head}"
+    )
+    return shard
 
 
 # ══════════════════════════════════════════════════════════════
@@ -821,6 +1002,108 @@ async def inference_models():
         return {"models": [], "error": str(e)}
 
 
+# ══════════════════════════════════════════════════════════════
+# P2P ACTIVATION TRANSPORT — Pipeline-parallel sidecar
+# ══════════════════════════════════════════════════════════════
+
+_pending_activations = asyncio.Queue(maxsize=16)  # Incoming activations from upstream
+_pending_gradients_back = asyncio.Queue(maxsize=16)  # Incoming gradients from downstream
+
+
+@app.post("/p2p/receive-activation")
+async def receive_activation(request: Request):
+    """
+    Receive activation tensor from upstream pipeline stage.
+    
+    Forward pass: Miner N finishes → compresses → POST here on Miner N+1.
+    The training loop picks this up from _pending_activations queue.
+    """
+    try:
+        body = await request.json()
+        transfer_id = body.get("transfer_id", "unknown")
+        direction = body.get("direction", "forward")
+
+        if direction == "forward":
+            await asyncio.wait_for(
+                _pending_activations.put(body),
+                timeout=30.0,
+            )
+            log_event(f"P2P: received activation {transfer_id[:12]}... from upstream ({body.get('source_miner', '?')})")
+        elif direction == "backward":
+            await asyncio.wait_for(
+                _pending_gradients_back.put(body),
+                timeout=30.0,
+            )
+            log_event(f"P2P: received gradient {transfer_id[:12]}... from downstream ({body.get('source_miner', '?')})")
+
+        return {"status": "received", "transfer_id": transfer_id, "queue_size": _pending_activations.qsize()}
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=503, detail="Activation queue full — miner busy")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to receive activation: {e}")
+
+
+@app.get("/p2p/status")
+async def p2p_status():
+    """Pipeline stage status — used by peers and server for health checks."""
+    assignment = miner_state.get("shard_assignment")
+    return {
+        "miner_id": miner_state.get("miner_id"),
+        "is_sharded": miner_state.get("is_sharded", False),
+        "pipeline_group_id": miner_state.get("pipeline_group_id"),
+        "stage_index": miner_state.get("stage_index"),
+        "status": miner_state.get("status"),
+        "pending_activations": _pending_activations.qsize(),
+        "pending_gradients": _pending_gradients_back.qsize(),
+        "layer_start": assignment.get("layer_start") if assignment else None,
+        "layer_end": assignment.get("layer_end") if assignment else None,
+        "upstream_peer": miner_state.get("upstream_peer"),
+        "downstream_peer": miner_state.get("downstream_peer"),
+        "model_loaded": _model_ref is not None,
+    }
+
+
+async def _send_activation_to_peer(peer_miner_id: str, payload: dict) -> bool:
+    """Send compressed activation tensor to a pipeline peer via HTTP POST."""
+    peer_url = _peer_addresses.get(peer_miner_id)
+    if not peer_url:
+        log_event(f"P2P: no address for peer {peer_miner_id}", "warning")
+        return False
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{peer_url}/p2p/receive-activation",
+                json=payload,
+            )
+            if resp.status_code == 200:
+                return True
+            else:
+                log_event(f"P2P: peer {peer_miner_id} returned {resp.status_code}", "warning")
+                return False
+    except Exception as e:
+        log_event(f"P2P: failed to send to {peer_miner_id}: {e}", "warning")
+        return False
+
+
+async def _wait_for_upstream_activation(timeout: float = 120.0) -> Optional[dict]:
+    """Wait for activation from upstream miner. Returns None on timeout."""
+    try:
+        return await asyncio.wait_for(_pending_activations.get(), timeout=timeout)
+    except asyncio.TimeoutError:
+        log_event("P2P: timeout waiting for upstream activation", "warning")
+        return None
+
+
+async def _wait_for_downstream_gradient(timeout: float = 120.0) -> Optional[dict]:
+    """Wait for gradient from downstream miner. Returns None on timeout."""
+    try:
+        return await asyncio.wait_for(_pending_gradients_back.get(), timeout=timeout)
+    except asyncio.TimeoutError:
+        log_event("P2P: timeout waiting for downstream gradient", "warning")
+        return None
+
+
 # ── WebSocket for live updates ──
 
 @app.websocket("/ws")
@@ -864,7 +1147,6 @@ def _safe_state() -> dict:
 def _real_training_step(task: dict, cycle: int, model, data, device_str: str):
     """Run actual forward/backward pass. Returns grad_data + model/data refs."""
     import torch
-    from model_architecture import create_model
     from real_trainer import get_tokenizer, DataShardLoader, RealTrainer, compress_gradients
 
     device = torch.device(device_str)
@@ -878,11 +1160,10 @@ def _real_training_step(task: dict, cycle: int, model, data, device_str: str):
         max_seq = task.get("max_seq_length", 4096)
         bs = task.get("batch_size", 8)
 
-    # Init model on first call
+    # Init model on first call — shard-aware
     if model is None:
-        model_id = task.get("model_id", "resonant-seed-1b")
-        model, _ = create_model(model_id)
-        model = model.to(device)
+        assignment = miner_state.get("shard_assignment")
+        model = _create_model_or_shard(task, assignment, device_str)
 
     # Init data on first call
     if data is None:
@@ -975,6 +1256,34 @@ async def _mining_loop(num_cycles: int):
                     log_event(f"Lighthouse: {resp.status_code} — continuing", "warning")
         except Exception as e:
             log_event(f"Lighthouse unavailable: {e}", "warning")
+
+        # Phase 1.5: Shard capability registration + assignment
+        log_event("Phase 1.5: Registering shard capability...")
+        await _register_capability(miner_id, token)
+        assignment = await _fetch_shard_assignment(miner_id, token)
+        if assignment:
+            miner_state["shard_assignment"] = assignment
+            miner_state["pipeline_group_id"] = assignment.get("pipeline_group_id")
+            miner_state["stage_index"] = assignment.get("stage_index")
+            miner_state["is_sharded"] = True
+            miner_state["upstream_peer"] = assignment.get("upstream_miner_id")
+            miner_state["downstream_peer"] = assignment.get("downstream_miner_id")
+            log_event(
+                f"Pipeline mode: stage {assignment['stage_index']}/{assignment['num_stages']} | "
+                f"layers {assignment['layer_start']}-{assignment['layer_end']} | "
+                f"upstream={assignment.get('upstream_miner_id', 'None')} | "
+                f"downstream={assignment.get('downstream_miner_id', 'None')}"
+            )
+            # Fetch peer addresses for P2P activation routing
+            peers_info = await _fetch_pipeline_peers(miner_id, token)
+            for p in peers_info.get("peers", []):
+                _peer_addresses[p["miner_id"]] = f"http://{p['address']}:{p['api_port']}"
+            log_event(f"Pipeline peers discovered: {len(_peer_addresses)} addresses")
+        else:
+            log_event("No shard assignment — full model training mode")
+            miner_state["is_sharded"] = False
+
+        await broadcast({"type": "state", "data": _safe_state()})
 
         # Phase 2: Genesis
         log_event("Phase 2: Checking genesis...")
