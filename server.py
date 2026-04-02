@@ -461,6 +461,101 @@ async def _report_shard_ready(miner_id: str, token: str) -> bool:
         return False
 
 
+async def _report_shard_loaded(miner_id: str, token: str, assignment: dict) -> bool:
+    """Report to the server that we've loaded our shard weights — registers us as a P2P source."""
+    urls = _platform_urls()
+    payload = {
+        "miner_id": miner_id,
+        "model_id": assignment.get("model_id", miner_state.get("model_id", "resonant-seed-1b")),
+        "layer_start": assignment["layer_start"],
+        "layer_end": assignment["layer_end"],
+        "weight_hash": miner_state.get("_shard_weight_hash", ""),
+        "size_bytes": miner_state.get("_shard_size_bytes", 0),
+        "num_params": miner_state.get("_shard_num_params", 0),
+        "miner_address": f"127.0.0.1:{PORT}",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{urls['mining']}/mining/weights/report-loaded",
+                headers={"Authorization": f"Bearer {token}"},
+                json=payload,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                log_event(
+                    f"Weight registry: shard registered "
+                    f"(key={data.get('shard_key', '?')}, "
+                    f"replicas={data.get('replicas', '?')})"
+                )
+                return True
+            else:
+                log_event(f"Weight registry report: HTTP {resp.status_code}", "warning")
+    except Exception as e:
+        log_event(f"Weight registry report failed: {e}", "warning")
+    return False
+
+
+async def _request_weight_transfer_plan(miner_id: str, token: str, assignment: dict) -> Optional[dict]:
+    """
+    Request a weight transfer plan from the server.
+    
+    The server tells us which peers have our assigned layers loaded,
+    so we can pull weights from them via P2P instead of initializing from scratch.
+    """
+    urls = _platform_urls()
+    payload = {
+        "miner_id": miner_id,
+        "model_id": assignment.get("model_id", miner_state.get("model_id", "resonant-seed-1b")),
+        "layer_start": assignment["layer_start"],
+        "layer_end": assignment["layer_end"],
+        "include_embedding": assignment.get("has_embedding", False),
+        "include_lm_head": assignment.get("has_lm_head", False),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{urls['mining']}/mining/weights/request-transfer",
+                headers={"Authorization": f"Bearer {token}"},
+                json=payload,
+            )
+            if resp.status_code == 200:
+                plan = resp.json()
+                peer_sources = [s for s in plan.get("sources", []) if s.get("type") == "peer"]
+                log_event(
+                    f"Weight transfer plan: {len(peer_sources)} peer sources, "
+                    f"{plan.get('total_mb', 0)} MB total"
+                )
+                return plan
+    except Exception as e:
+        log_event(f"Weight transfer plan request failed: {e}", "warning")
+    return None
+
+
+async def _download_weights_from_peer(peer_address: str, model_id: str, layer_start: int, layer_end: int) -> Optional[dict]:
+    """
+    Download weight tensors from a peer miner via P2P.
+    
+    Returns the state_dict if successful, None otherwise.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(
+                f"http://{peer_address}/p2p/serve-weights",
+                params={
+                    "model_id": model_id,
+                    "layer_start": layer_start,
+                    "layer_end": layer_end,
+                },
+            )
+            if resp.status_code == 200:
+                log_event(f"P2P: Downloaded weights from {peer_address}")
+                return resp.json()
+    except Exception as e:
+        log_event(f"P2P weight download from {peer_address} failed: {e}", "warning")
+    return None
+
+
 def _create_model_or_shard(task: dict, assignment: Optional[dict], device_str: str):
     """
     Create either a full model or a ModelShard depending on assignment.
@@ -469,6 +564,7 @@ def _create_model_or_shard(task: dict, assignment: Optional[dict], device_str: s
     If assignment is set: creates only our pipeline shard (partial model).
     """
     import torch
+    import hashlib
 
     if assignment is None:
         # Original full-model path
@@ -497,11 +593,25 @@ def _create_model_or_shard(task: dict, assignment: Optional[dict], device_str: s
     shard = shard.to(device)
 
     num_params = sum(p.numel() for p in shard.parameters())
-    size_mb = num_params * 2 / 1e6  # fp16
+    size_bytes = num_params * 2  # fp16
+
+    # Compute weight hash for integrity verification
+    h = hashlib.sha256()
+    for name, param in sorted(shard.named_parameters()):
+        h.update(name.encode())
+        h.update(param.detach().cpu().numpy().tobytes())
+    weight_hash = h.hexdigest()
+
+    # Store shard metadata for reporting to the registry
+    miner_state["_shard_weight_hash"] = weight_hash
+    miner_state["_shard_num_params"] = num_params
+    miner_state["_shard_size_bytes"] = size_bytes
+
     logger.info(
         f"ModelShard loaded: layers {layer_start}-{layer_end} | "
-        f"{num_params:,} params ({size_mb:.0f} MB) | "
-        f"embed={has_embedding} lm_head={has_lm_head}"
+        f"{num_params:,} params ({size_bytes / 1e6:.0f} MB) | "
+        f"embed={has_embedding} lm_head={has_lm_head} | "
+        f"hash={weight_hash[:16]}..."
     )
     return shard
 
@@ -1043,6 +1153,53 @@ async def receive_activation(request: Request):
         raise HTTPException(status_code=500, detail=f"Failed to receive activation: {e}")
 
 
+@app.get("/p2p/serve-weights")
+async def serve_weights(model_id: str = "", layer_start: int = 0, layer_end: int = 0):
+    """
+    Serve our loaded weight tensors to a requesting peer miner.
+    
+    This is the P2P weight sharing endpoint — when a new miner joins
+    and needs layers we have, it pulls directly from us instead of
+    going to the seed slicer. The model lives across the network.
+    """
+    import hashlib as _hashlib
+
+    if _model_ref is None:
+        raise HTTPException(status_code=503, detail="No model loaded yet")
+
+    assignment = miner_state.get("shard_assignment")
+    if not assignment:
+        raise HTTPException(status_code=503, detail="Not in sharded mode")
+
+    # Verify we actually have the requested layers
+    our_start = assignment.get("layer_start", 0)
+    our_end = assignment.get("layer_end", 0)
+    if layer_start < our_start or layer_end > our_end:
+        raise HTTPException(
+            status_code=404,
+            detail=f"We hold layers {our_start}-{our_end}, requested {layer_start}-{layer_end}"
+        )
+
+    # Serialize our model state_dict for transfer
+    state = {}
+    for name, param in _model_ref.named_parameters():
+        state[name] = {
+            "shape": list(param.shape),
+            "dtype": str(param.dtype),
+            "hash": _hashlib.sha256(param.detach().cpu().numpy().tobytes()).hexdigest()[:16],
+        }
+
+    return {
+        "model_id": model_id or miner_state.get("model_id", ""),
+        "layer_start": our_start,
+        "layer_end": our_end,
+        "num_params": sum(p.numel() for p in _model_ref.parameters()),
+        "weight_hash": miner_state.get("_shard_weight_hash", ""),
+        "params": state,
+        "status": "available",
+    }
+
+
 @app.get("/p2p/status")
 async def p2p_status():
     """Pipeline stage status — used by peers and server for health checks."""
@@ -1279,6 +1436,33 @@ async def _mining_loop(num_cycles: int):
             for p in peers_info.get("peers", []):
                 _peer_addresses[p["miner_id"]] = f"http://{p['address']}:{p['api_port']}"
             log_event(f"Pipeline peers discovered: {len(_peer_addresses)} addresses")
+
+            # Phase 1.6: Network-native weight loading
+            log_event("Phase 1.6: Requesting weight transfer plan...")
+            transfer_plan = await _request_weight_transfer_plan(miner_id, token, assignment)
+            if transfer_plan:
+                peer_sources = [s for s in transfer_plan.get("sources", []) if s.get("type") == "peer"]
+                if peer_sources:
+                    log_event(f"Found {len(peer_sources)} peers with our layers — attempting P2P download")
+                    for source in peer_sources:
+                        addr = source.get("address", "")
+                        if addr:
+                            weights = await _download_weights_from_peer(
+                                addr, assignment.get("model_id", ""),
+                                assignment["layer_start"], assignment["layer_end"]
+                            )
+                            if weights:
+                                log_event(f"P2P weight download succeeded from {addr}")
+                                miner_state["_weight_source"] = f"peer:{addr}"
+                                break
+                    else:
+                        log_event("No P2P peer reachable — will initialize from scratch")
+                        miner_state["_weight_source"] = "genesis"
+                else:
+                    log_event("No peer sources in plan — will initialize from scratch")
+                    miner_state["_weight_source"] = "genesis"
+            else:
+                miner_state["_weight_source"] = "genesis"
         else:
             log_event("No shard assignment — full model training mode")
             miner_state["is_sharded"] = False
@@ -1361,6 +1545,11 @@ async def _mining_loop(num_cycles: int):
 
                     global _model_ref
                     _model_ref = model  # Persist for download
+
+                    # Report loaded weights to registry on first cycle
+                    if cycle == 1 and miner_state.get("is_sharded") and miner_state.get("shard_assignment"):
+                        await _report_shard_loaded(miner_id, token, miner_state["shard_assignment"])
+                        await _report_shard_ready(miner_id, token)
 
                     elapsed = time.time() - train_start
                     loss_b = grad_data["loss_before"]
