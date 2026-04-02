@@ -29,10 +29,18 @@ enabling NAT traversal without port forwarding.
 """
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 from typing import Dict, Optional, Set, AsyncGenerator
 import uuid
+
+try:
+    import httpx
+    HTTPX_AVAILABLE = True
+except ImportError:
+    HTTPX_AVAILABLE = False
 
 try:
     import aiortc
@@ -71,6 +79,7 @@ class WebRTCClient:
         self.miner_id = miner_id
         self.mining_url = mining_url.rstrip("/")
         self.signaling_url = f"{self.mining_url}/mining/p2p/signaling/{miner_id}"
+        self.api_url = mining_url.rstrip("/mining")  # Remove /mining for API calls
         
         # WebRTC connections: peer_id -> RTCPeerConnection
         self.peer_connections: Dict[str, RTCPeerConnection] = {}
@@ -452,6 +461,173 @@ class WebRTCClient:
             logger.info(f"Sent weight shard {shard_key} to {from_peer_id}")
         else:
             logger.error(f"Failed to send weight shard {shard_key} to {from_peer_id}")
+    
+    async def verify_received_weights(
+        self,
+        source_miner_id: str,
+        model_id: str,
+        layer_start: int,
+        layer_end: int,
+        weight_data: bytes,
+        expected_hash: str,
+        transfer_id: str = None,
+    ) -> Tuple[bool, str]:
+        """
+        Verify weights received from a peer and report violations.
+        
+        Returns:
+            (is_valid, error_message)
+        """
+        if not HTTPX_AVAILABLE:
+            logger.warning("httpx not available - skipping weight verification")
+            return True, "Verification skipped (httpx not available)"
+        
+        # Verify locally first
+        actual_hash = hashlib.sha256(weight_data).hexdigest()
+        if actual_hash != expected_hash:
+            logger.error(f"Weight hash mismatch from {source_miner_id}: expected {expected_hash}, got {actual_hash}")
+            # Report to slashing service
+            await self._report_weight_violation(
+                source_miner_id=source_miner_id,
+                model_id=model_id,
+                layer_start=layer_start,
+                layer_end=layer_end,
+                weight_data=weight_data,
+                expected_hash=expected_hash,
+                actual_hash=actual_hash,
+                transfer_id=transfer_id,
+            )
+            return False, f"Weight hash mismatch: expected {expected_hash}, got {actual_hash}"
+        
+        # Report to slashing service for verification
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{self.api_url}/mining/slashing/verify-weights",
+                    json={
+                        "source_miner_id": source_miner_id,
+                        "model_id": model_id,
+                        "layer_start": layer_start,
+                        "layer_end": layer_end,
+                        "weight_data": base64.b64encode(weight_data).decode(),
+                        "expected_hash": expected_hash,
+                        "transfer_id": transfer_id,
+                    },
+                    headers={"Authorization": f"Bearer {getattr(self, '_auth_token', '')}"},
+                )
+                response.raise_for_status()
+                result = response.json()
+                return result["valid"], result.get("error")
+        except Exception as e:
+            logger.error(f"Failed to verify weights with slashing service: {e}")
+            # Accept weights if verification service is down
+            return True, "Verification service unavailable"
+    
+    async def _report_weight_violation(
+        self,
+        source_miner_id: str,
+        model_id: str,
+        layer_start: int,
+        layer_end: int,
+        weight_data: bytes,
+        expected_hash: str,
+        actual_hash: str,
+        transfer_id: str = None,
+    ):
+        """Report a weight violation to the slashing service."""
+        if not HTTPX_AVAILABLE:
+            return
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                await client.post(
+                    f"{self.api_url}/mining/slashing/report-violation",
+                    json={
+                        "violator_miner_id": source_miner_id,
+                        "violation_type": "weight_hash_mismatch",
+                        "evidence": {
+                            "model_id": model_id,
+                            "layer_start": layer_start,
+                            "layer_end": layer_end,
+                            "expected_hash": expected_hash,
+                            "actual_hash": actual_hash,
+                            "weight_size": len(weight_data),
+                            "transfer_id": transfer_id,
+                        },
+                        "description": f"Weight hash mismatch for shard {model_id}:L{layer_start}-{layer_end}",
+                    },
+                    headers={"Authorization": f"Bearer {getattr(self, '_auth_token', '')}"},
+                )
+        except Exception as e:
+            logger.error(f"Failed to report violation: {e}")
+    
+    async def receive_weight_shard(
+        self,
+        from_peer_id: str,
+        model_id: str,
+        layer_start: int,
+        layer_end: int,
+        expected_hash: str,
+        timeout: float = 30.0,
+    ) -> Optional[bytes]:
+        """
+        Receive a weight shard from a peer with verification.
+        
+        Returns the weight data if valid, None if verification fails.
+        """
+        # Send transfer request
+        request = {
+            "type": "weight-transfer-request",
+            "model_id": model_id,
+            "layer_start": layer_start,
+            "layer_end": layer_end,
+            "expected_hash": expected_hash,
+        }
+        
+        if not await self.send_to_peer(from_peer_id, request):
+            logger.error(f"Failed to send transfer request to {from_peer_id}")
+            return None
+        
+        # Wait for response
+        start_time = asyncio.get_event_loop().time()
+        while asyncio.get_event_loop().time() - start_time < timeout:
+            try:
+                message = await asyncio.wait_for(self.message_queue.get(), timeout=1.0)
+                if (message.get("from_peer_id") == from_peer_id and 
+                    message.get("type") == "binary"):
+                    weight_data = message["data"]
+                    metadata = message.get("metadata", {})
+                    
+                    # Verify weights
+                    is_valid, error = await self.verify_received_weights(
+                        source_miner_id=from_peer_id,
+                        model_id=model_id,
+                        layer_start=layer_start,
+                        layer_end=layer_end,
+                        weight_data=weight_data,
+                        expected_hash=expected_hash,
+                        transfer_id=metadata.get("transfer_id"),
+                    )
+                    
+                    if is_valid:
+                        logger.info(f"Successfully received and verified weight shard from {from_peer_id}")
+                        return weight_data
+                    else:
+                        logger.error(f"Weight verification failed: {error}")
+                        return None
+                        
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error(f"Error receiving weight shard: {e}")
+                return None
+        
+        logger.error(f"Timeout waiting for weight shard from {from_peer_id}")
+        return None
+    
+    def set_auth_token(self, token: str):
+        """Set authentication token for API calls."""
+        self._auth_token = token
     
     def get_status(self) -> Dict:
         """Get current connection status."""
