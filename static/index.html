@@ -259,6 +259,7 @@ const API = '';
 let ws = null;
 let state = {};
 let authPollInterval = null;
+let csrfToken = null;
 
 // ══════════════════════════════════════════════════════════════
 // AUTH — Platform Redirect (same flow as Resonant IDE Extension)
@@ -269,8 +270,20 @@ async function checkAuthStatus() {
     const r = await fetch('/api/auth/status');
     const d = await r.json();
     if (d.authenticated) {
+      csrfToken = d.csrf_token || null;
+      // If server restored session from encrypted file, set the session cookie
+      if (d.set_session) {
+        document.cookie = 'rg_session=' + d.set_session + '; path=/; max-age=86400; SameSite=Lax';
+        // Re-fetch to confirm with cookie now set
+        const r2 = await fetch('/api/auth/status');
+        const d2 = await r2.json();
+        if (d2.authenticated) { csrfToken = d2.csrf_token || csrfToken; }
+      }
       showDashboard(d);
       return true;
+    }
+    if (d.reason === 'token_expired') {
+      console.warn('Session expired — please log in again');
     }
   } catch(e) {}
   return false;
@@ -376,7 +389,10 @@ async function loadSysInfoForDashboard() {
 async function doLogout() {
   if (ws) ws.close();
   if (authPollInterval) clearInterval(authPollInterval);
-  await fetch('/api/logout', {method:'POST'});
+  const headers = {};
+  if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
+  await fetch('/api/logout', {method:'POST', headers});
+  csrfToken = null;
   document.getElementById('dashboard-page').style.display = 'none';
   document.getElementById('signin-page').style.display = 'flex';
   // Reset button
@@ -455,7 +471,9 @@ async function startMining() {
   const model_id = document.getElementById('ctl-model').value;
   const cycles = parseInt(document.getElementById('ctl-cycles').value) || 5;
   document.getElementById('log-panel').innerHTML = '';
-  const r = await fetch('/api/mining/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model_id, cycles}) });
+  const headers = {'Content-Type':'application/json'};
+  if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
+  const r = await fetch('/api/mining/start', { method:'POST', headers, body: JSON.stringify({model_id, cycles}) });
   if (!r.ok) {
     const d = await r.json();
     addLog({ts: new Date().toISOString(), level: 'error', msg: d.detail || 'Failed to start'});
@@ -463,7 +481,9 @@ async function startMining() {
 }
 
 async function stopMining() {
-  await fetch('/api/mining/stop', {method:'POST'});
+  const headers = {};
+  if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
+  await fetch('/api/mining/stop', {method:'POST', headers});
 }
 
 // ══════════════════════════════════════════════════════════════

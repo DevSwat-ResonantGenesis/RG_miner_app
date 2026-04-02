@@ -24,19 +24,25 @@ Usage:
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
 import os
+import platform
 import random
+import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-import secrets
 from uuid import uuid4
+
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Response
@@ -51,16 +57,128 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rg-miner")
 
-# ── Production endpoints ──
-PROD_BASE = os.getenv("RG_PLATFORM_URL", "https://dev-swat.com")
-AUTH_URL = f"{PROD_BASE}/api"
-MINING_URL = f"{PROD_BASE}/mining"
-LIGHTHOUSE_URL = f"{PROD_BASE}/lighthouse"
-EXT_CHAIN_URL = f"{PROD_BASE}/ext-chain"
-WS_HOST = PROD_BASE.replace("https://", "").replace("http://", "")
-MINING_WS_URL = f"wss://{WS_HOST}/ws/mining"
+# ── Production endpoints — dual-domain fallback (same as Resonant IDE) ──
+PLATFORM_DOMAINS = [
+    os.getenv("RG_PLATFORM_URL", "https://dev-swat.com"),
+    "https://resonantgenesis.xyz",
+]
+PROD_BASE = PLATFORM_DOMAINS[0]  # Updated at startup after health check
 
 PORT = int(os.getenv("RG_MINER_PORT", "3000"))
+
+# ── Encrypted token storage ──
+_TOKEN_DIR = Path.home() / ".rg_miner"
+_TOKEN_FILE = _TOKEN_DIR / "auth.enc"
+
+
+def _get_fernet() -> Fernet:
+    """Derive a machine-specific encryption key (same concept as OS keyring)."""
+    salt = (platform.node() + "-rg-miner-salt").encode()
+    machine_id = (platform.node() + platform.machine() + os.getenv("USER", "default")).encode()
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=480_000)
+    key = base64.urlsafe_b64encode(kdf.derive(machine_id))
+    return Fernet(key)
+
+
+def _save_token_encrypted(token: str, email: str, user_id: str, user_name: str):
+    """Persist auth to encrypted file on disk."""
+    try:
+        _TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({"jwt": token, "email": email, "user_id": user_id, "user_name": user_name, "ts": time.time()})
+        _TOKEN_FILE.write_bytes(_get_fernet().encrypt(payload.encode()))
+        _TOKEN_FILE.chmod(0o600)
+    except Exception as e:
+        logger.warning(f"Failed to save encrypted token: {e}")
+
+
+def _load_token_encrypted() -> Optional[dict]:
+    """Load auth from encrypted file. Returns None if missing/invalid."""
+    try:
+        if not _TOKEN_FILE.exists():
+            return None
+        data = json.loads(_get_fernet().decrypt(_TOKEN_FILE.read_bytes()).decode())
+        # Check JWT expiry
+        if _is_jwt_expired(data.get("jwt", "")):
+            logger.info("Stored token expired — clearing")
+            _clear_token_file()
+            return None
+        return data
+    except Exception as e:
+        logger.warning(f"Failed to load encrypted token: {e}")
+        return None
+
+
+def _clear_token_file():
+    """Remove encrypted token file."""
+    try:
+        if _TOKEN_FILE.exists():
+            _TOKEN_FILE.unlink()
+    except Exception:
+        pass
+
+
+def _is_jwt_expired(token: str) -> bool:
+    """Decode JWT payload and check exp claim (no signature verification — server does that)."""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return True
+        payload = parts[1]
+        # Add padding
+        payload += "=" * (4 - len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        exp = data.get("exp", 0)
+        return time.time() > exp
+    except Exception:
+        return True
+
+
+async def _health_check_domain(domain: str) -> bool:
+    """Quick health check — 3s timeout (same as Resonant IDE)."""
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            resp = await client.head(f"{domain}/api/v1/health")
+            return resp.status_code < 500
+    except Exception:
+        return False
+
+
+async def _resolve_platform() -> str:
+    """Find first reachable domain (dual-domain fallback like Resonant IDE)."""
+    global PROD_BASE
+    for domain in PLATFORM_DOMAINS:
+        if await _health_check_domain(domain):
+            PROD_BASE = domain
+            return domain
+    PROD_BASE = PLATFORM_DOMAINS[0]
+    return PROD_BASE
+
+
+def _platform_urls():
+    """Return current platform URLs derived from PROD_BASE."""
+    host = PROD_BASE.replace("https://", "").replace("http://", "")
+    return {
+        "auth": f"{PROD_BASE}/api",
+        "mining": f"{PROD_BASE}/mining",
+        "lighthouse": f"{PROD_BASE}/lighthouse",
+        "ext_chain": f"{PROD_BASE}/ext-chain",
+        "ws_mining": f"wss://{host}/ws/mining",
+    }
+
+
+async def _verify_token_with_platform(token: str) -> Optional[dict]:
+    """Re-verify JWT with platform /auth/me — returns user info or None."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{PROD_BASE}/auth/me",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if resp.status_code == 200:
+                return resp.json()
+    except Exception:
+        pass
+    return None
 
 # ── Global miner state ──
 miner_state = {
@@ -86,6 +204,7 @@ miner_state = {
 _training_task: Optional[asyncio.Task] = None
 _ws_clients: set = set()
 _session_token: Optional[str] = None  # Random token set on auth, checked via cookie
+_csrf_token: Optional[str] = None  # CSRF token, regenerated per session
 
 
 # ── Helpers ──
@@ -108,6 +227,15 @@ def log_event(msg: str, level: str = "info"):
         miner_state["training_log"] = miner_state["training_log"][-500:]
     asyncio.create_task(broadcast({"type": "log", **entry}))
     getattr(logger, level if level != "warning" else "warning", logger.info)(msg)
+
+
+def _check_csrf(request: Request):
+    """Validate CSRF token on state-changing requests."""
+    if not _csrf_token:
+        return  # No session yet — skip
+    header_token = request.headers.get("x-csrf-token", "")
+    if header_token != _csrf_token:
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
 
 
 def _detect_device():
@@ -135,7 +263,18 @@ async def lifespan(app: FastAPI):
     logger.info(f"RG Miner App starting on http://localhost:{PORT}")
     logger.info(f"  Device: {dev_name}")
     logger.info(f"  PyTorch: {'available' if torch_ok else 'NOT installed'}")
-    logger.info(f"  Platform: {PROD_BASE}")
+    # Dual-domain health check (same as Resonant IDE)
+    resolved = await _resolve_platform()
+    logger.info(f"  Platform: {resolved}")
+    # Try to restore session from encrypted token file
+    stored = _load_token_encrypted()
+    if stored and stored.get("jwt"):
+        logger.info(f"  Restored session: {stored.get('email', '?')} (encrypted storage)")
+        miner_state["jwt_token"] = stored["jwt"]
+        miner_state["user_email"] = stored.get("email", "")
+        miner_state["user_id"] = stored.get("user_id", "")
+        miner_state["user_name"] = stored.get("user_name", "")
+        miner_state["miner_id"] = f"miner-{stored.get('email', 'user').split('@')[0]}-{uuid4().hex[:6]}"
     yield
     if _training_task and not _training_task.done():
         _training_task.cancel()
@@ -164,32 +303,24 @@ async def auth_callback(request: Request):
     if not token:
         return HTMLResponse(content="<h2>Authentication failed</h2><p>No token received. <a href='/'>Try again</a></p>", status_code=400)
 
-    # Fetch real user info from platform — same as Resonant IDE (GET /api/v1/auth/verify)
-    email = ""
-    user_id = ""
-    user_name = ""
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{PROD_BASE}/auth/me",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                email = data.get("email", "")
-                user_id = data.get("user_id", data.get("id", ""))
-                user_name = data.get("full_name", data.get("name", ""))
-                logger.info(f"Verified user: {email} ({user_name})")
-            else:
-                logger.warning(f"Auth verify returned {resp.status_code}")
-    except Exception as e:
-        logger.warning(f"Auth verify failed: {e}")
+    # Check JWT expiry before proceeding
+    if _is_jwt_expired(token):
+        return HTMLResponse(content="<h2>Token expired</h2><p>Please log in again. <a href='/'>Back</a></p>", status_code=401)
 
-    if not email:
-        email = "user@resonantgenesis.com"
+    # Verify with platform — same as Resonant IDE (GET /auth/me)
+    user_info = await _verify_token_with_platform(token)
+    if user_info:
+        email = user_info.get("email", "")
+        user_id = user_info.get("user_id", user_info.get("id", ""))
+        user_name = user_info.get("full_name", user_info.get("name", ""))
+        logger.info(f"Verified user: {email} ({user_name})")
+    else:
+        logger.warning("Platform verification failed — rejecting token")
+        return HTMLResponse(content="<h2>Verification failed</h2><p>Could not verify with platform. <a href='/'>Try again</a></p>", status_code=401)
 
-    global _session_token
+    global _session_token, _csrf_token
     _session_token = secrets.token_urlsafe(32)
+    _csrf_token = secrets.token_urlsafe(32)
 
     miner_state["jwt_token"] = token
     miner_state["user_email"] = email
@@ -197,6 +328,9 @@ async def auth_callback(request: Request):
     miner_state["user_name"] = user_name
     miner_state["miner_id"] = f"miner-{email.split('@')[0]}-{uuid4().hex[:6]}"
     miner_state["error"] = None
+
+    # Persist to encrypted file (survives restarts)
+    _save_token_encrypted(token, email, user_id, user_name)
 
     dev, _, dev_name = _detect_device()
     logger.info(f"Authenticated: {email} | Device: {dev_name}")
@@ -238,19 +372,40 @@ async def get_auth_url():
 @app.get("/api/auth/status")
 async def auth_status(request: Request):
     """Check if user is authenticated — requires valid session cookie."""
+    global _session_token, _csrf_token
     cookie = request.cookies.get("rg_session")
+
+    # Case 1: Valid session cookie
     if _session_token and cookie == _session_token and miner_state["jwt_token"]:
-        return {"authenticated": True, "email": miner_state["user_email"], "miner_id": miner_state["miner_id"]}
+        # Check JWT not expired
+        if _is_jwt_expired(miner_state["jwt_token"]):
+            _session_token = None
+            _csrf_token = None
+            _clear_token_file()
+            miner_state.update({"jwt_token": None, "user_email": None, "miner_id": None})
+            return {"authenticated": False, "reason": "token_expired"}
+        return {"authenticated": True, "email": miner_state["user_email"], "miner_id": miner_state["miner_id"], "csrf_token": _csrf_token}
+
+    # Case 2: No cookie but server has restored session from encrypted file — issue new session
+    if not _session_token and miner_state["jwt_token"] and not _is_jwt_expired(miner_state["jwt_token"]):
+        _session_token = secrets.token_urlsafe(32)
+        _csrf_token = secrets.token_urlsafe(32)
+        return {"authenticated": True, "email": miner_state["user_email"], "miner_id": miner_state["miner_id"], "csrf_token": _csrf_token, "set_session": _session_token}
+
     return {"authenticated": False}
 
 
 @app.post("/api/logout")
-async def logout():
-    """Clear session and cookie."""
-    global _training_task, _session_token
+async def logout(request: Request):
+    """Clear session, cookie, CSRF, and encrypted token file."""
+    global _training_task, _session_token, _csrf_token
+    # CSRF check on logout too
+    _check_csrf(request)
     if _training_task and not _training_task.done():
         _training_task.cancel()
     _session_token = None
+    _csrf_token = None
+    _clear_token_file()
     miner_state.update({"status": "idle", "jwt_token": None, "user_email": None, "miner_id": None, "user_id": None})
     response = JSONResponse({"success": True})
     response.delete_cookie("rg_session", path="/")
@@ -263,8 +418,15 @@ async def logout():
 async def start_mining(request: Request):
     global _training_task
 
+    _check_csrf(request)
     if not miner_state["jwt_token"]:
         raise HTTPException(status_code=401, detail="Login first")
+    # Re-verify JWT with platform before starting mining
+    if _is_jwt_expired(miner_state["jwt_token"]):
+        raise HTTPException(status_code=401, detail="Token expired — please re-login")
+    user_info = await _verify_token_with_platform(miner_state["jwt_token"])
+    if not user_info:
+        raise HTTPException(status_code=401, detail="Token invalid — please re-login")
     if miner_state["status"] == "training":
         raise HTTPException(status_code=409, detail="Already mining")
 
@@ -291,8 +453,9 @@ async def start_mining(request: Request):
 
 
 @app.post("/api/mining/stop")
-async def stop_mining():
+async def stop_mining(request: Request):
     global _training_task
+    _check_csrf(request)
     if _training_task and not _training_task.done():
         _training_task.cancel()
     miner_state["status"] = "idle"
@@ -327,9 +490,10 @@ async def system_info():
 
 @app.get("/api/network/health")
 async def network_health():
+    urls = _platform_urls()
     results = {}
     async with httpx.AsyncClient(timeout=5) as client:
-        for name, url in [("mining", f"{MINING_URL}/health"), ("lighthouse", f"{LIGHTHOUSE_URL}/health"), ("blockchain", f"{EXT_CHAIN_URL}/health")]:
+        for name, url in [("mining", f"{urls['mining']}/health"), ("lighthouse", f"{urls['lighthouse']}/health"), ("blockchain", f"{urls['ext_chain']}/health")]:
             try:
                 resp = await client.get(url)
                 results[name] = resp.json() if resp.status_code == 200 else {"status": "error", "code": resp.status_code}
@@ -342,7 +506,7 @@ async def network_health():
 async def get_models():
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(f"{MINING_URL}/mining/models")
+            resp = await client.get(f"{_platform_urls()['mining']}/mining/models")
             return resp.json()
     except Exception as e:
         return {"error": str(e)}
@@ -352,7 +516,7 @@ async def get_models():
 async def get_training_data():
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(f"{MINING_URL}/mining/training-data")
+            resp = await client.get(f"{_platform_urls()['mining']}/mining/training-data")
             return resp.json()
     except Exception as e:
         return {"error": str(e)}
@@ -363,7 +527,7 @@ async def get_dashboard_data():
     """Proxy the mesh dashboard data."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(f"{MINING_URL}/dashboard/data")
+            resp = await client.get(f"{_platform_urls()['mining']}/dashboard/data")
             return resp.json()
     except Exception as e:
         return {"error": str(e)}
@@ -505,13 +669,14 @@ async def _mining_loop(num_cycles: int):
     log_event(f"Starting mining: {mode} | Model: {miner_state['model_id']} | {num_cycles} cycles")
     await broadcast({"type": "state", "data": _safe_state()})
 
+    urls = _platform_urls()
     try:
         # Phase 1: Lighthouse
         log_event("Phase 1: Registering with Lighthouse...")
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.post(
-                    f"{LIGHTHOUSE_URL}/lighthouse/register",
+                    f"{urls['lighthouse']}/lighthouse/register",
                     headers={"Authorization": f"Bearer {token}"},
                     json={"peer_id": miner_id, "peer_type": "miner", "address": "127.0.0.1", "p2p_port": 8600, "api_port": PORT, "node_version": "1.0.0", "capabilities": ["training", "gradient_submit"]},
                 )
@@ -527,14 +692,14 @@ async def _mining_loop(num_cycles: int):
         log_event("Phase 2: Checking genesis...")
         try:
             async with httpx.AsyncClient(timeout=10, headers={"Authorization": f"Bearer {token}"}) as client:
-                resp = await client.get(f"{MINING_URL}/mining/genesis/status")
+                resp = await client.get(f"{urls['mining']}/mining/genesis/status")
                 if resp.status_code == 200:
                     gs = resp.json()
                     if gs.get("genesis", {}).get("initialized"):
                         log_event("Genesis already initialized")
                     else:
                         log_event("Initializing genesis seed...")
-                        await client.post(f"{MINING_URL}/mining/genesis/initialize", json={"model_id": miner_state["model_id"], "miner_ids": [miner_id], "ipfs_base_url": "ipfs://"})
+                        await client.post(f"{urls['mining']}/mining/genesis/initialize", json={"model_id": miner_state["model_id"], "miner_ids": [miner_id], "ipfs_base_url": "ipfs://"})
                         log_event("Genesis initialized")
                 else:
                     log_event(f"Genesis status: HTTP {resp.status_code}", "warning")
@@ -546,7 +711,7 @@ async def _mining_loop(num_cycles: int):
         await broadcast({"type": "state", "data": _safe_state()})
         log_event("Phase 3: Starting mining cycles...")
 
-        ws_url = f"{MINING_WS_URL}?token={token}"
+        ws_url = f"{urls['ws_mining']}?token={token}"
         model = None
         data = None
 
