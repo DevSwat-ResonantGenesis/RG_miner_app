@@ -122,6 +122,37 @@ a { color: var(--accent2); text-decoration: none; }
 .tab-content { display: none; }
 .tab-content.active { display: block; }
 
+/* Metrics table */
+.metrics-table { width: 100%; border-collapse: collapse; font-size: 12px; font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+.metrics-table th { text-align: left; padding: 6px 10px; color: var(--text2); font-size: 10px; text-transform: uppercase; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--surface); }
+.metrics-table td { padding: 5px 10px; border-bottom: 1px solid rgba(42,42,62,0.4); }
+.metrics-table tr:hover { background: rgba(108,92,231,0.05); }
+.metrics-scroll { max-height: 350px; overflow-y: auto; }
+.summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.summary-item { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; text-align: center; }
+.summary-item .val { font-size: 20px; font-weight: 700; color: var(--accent2); }
+.summary-item .lbl { font-size: 10px; color: var(--text2); text-transform: uppercase; margin-top: 4px; }
+
+/* Chat inference */
+.chat-container { display: flex; flex-direction: column; height: 400px; }
+.chat-messages { flex: 1; overflow-y: auto; padding: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius) var(--radius) 0 0; }
+.chat-msg { margin-bottom: 12px; line-height: 1.5; font-size: 14px; }
+.chat-msg.user { color: var(--accent2); }
+.chat-msg.assistant { color: var(--text); }
+.chat-msg .role { font-size: 10px; text-transform: uppercase; color: var(--text2); margin-bottom: 2px; }
+.chat-input-row { display: flex; gap: 8px; }
+.chat-input-row textarea { flex: 1; padding: 10px 14px; border-radius: 0 0 0 var(--radius); border: 1px solid var(--border); border-top: none; background: var(--surface); color: var(--text); font-size: 14px; font-family: inherit; resize: none; outline: none; min-height: 42px; }
+.chat-input-row textarea:focus { border-color: var(--accent); }
+.chat-input-row button { padding: 10px 20px; border-radius: 0 0 var(--radius) 0; border: 1px solid var(--accent); border-top: none; background: var(--accent); color: white; font-weight: 600; cursor: pointer; }
+.chat-input-row button:hover { background: var(--accent2); }
+
+/* Model download */
+.download-section { display: flex; align-items: center; gap: 16px; padding: 16px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); }
+.download-section .icon { font-size: 32px; }
+.download-section .info { flex: 1; }
+.download-section .info h4 { font-size: 15px; margin-bottom: 4px; }
+.download-section .info p { font-size: 12px; color: var(--text2); }
+
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
 @media (max-width: 900px) { .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; } }
@@ -220,7 +251,10 @@ a { color: var(--accent2); text-decoration: none; }
       <div class="tabs">
         <div class="tab active" data-tab="log" onclick="switchTab('log')">Training Log</div>
         <div class="tab" data-tab="chart" onclick="switchTab('chart')">Loss Chart</div>
+        <div class="tab" data-tab="metrics" onclick="switchTab('metrics')">Metrics</div>
         <div class="tab" data-tab="models" onclick="switchTab('models')">Model Registry</div>
+        <div class="tab" data-tab="model-dl" onclick="switchTab('model-dl')">Model Download</div>
+        <div class="tab" data-tab="inference" onclick="switchTab('inference')">LLM Inference</div>
         <div class="tab" data-tab="network" onclick="switchTab('network')">Network</div>
       </div>
 
@@ -233,6 +267,60 @@ a { color: var(--accent2); text-decoration: none; }
           <h3>Loss Over Training Cycles</h3>
           <div class="chart-container">
             <canvas id="loss-canvas" style="width:100%;height:100%"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <div id="tab-metrics" class="tab-content">
+        <div class="card">
+          <h3>Training Metrics Summary</h3>
+          <div class="summary-grid" id="metrics-summary"></div>
+          <h3 style="margin-top:16px">Per-Cycle Details</h3>
+          <div class="metrics-scroll">
+            <table class="metrics-table">
+              <thead><tr><th>Cycle</th><th>Epoch</th><th>Loss Before</th><th>Loss After</th><th>Delta</th><th>Grad Norm</th><th>LR</th><th>Samples</th><th>Throughput</th><th>Compression</th><th>Time</th></tr></thead>
+              <tbody id="metrics-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card" style="margin-top:16px">
+          <h3>Parameter Server</h3>
+          <div id="param-server-info" style="font-size:13px;color:var(--text2)">Loading...</div>
+        </div>
+      </div>
+
+      <div id="tab-model-dl" class="tab-content">
+        <div class="card">
+          <h3>Model Weights</h3>
+          <p style="font-size:13px;color:var(--text2);margin-bottom:16px">Download the locally trained model weights as a PyTorch .pt checkpoint file. The model must have completed at least 1 training cycle.</p>
+          <div class="download-section" id="model-dl-section">
+            <div class="icon">&#128190;</div>
+            <div class="info" id="model-dl-info">
+              <h4>Checking model status...</h4>
+              <p>Loading...</p>
+            </div>
+            <button class="btn btn-success" id="btn-download" onclick="downloadModel()" disabled>Download .pt</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="tab-inference" class="tab-content">
+        <div class="card">
+          <h3>LLM Inference — Chat with Platform Models</h3>
+          <p style="font-size:13px;color:var(--text2);margin-bottom:12px">Connect to the ResonantGenesis platform LLM providers. Requires active authentication.</p>
+          <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center">
+            <label style="font-size:12px;color:var(--text2)">Model:</label>
+            <select id="inference-model" style="font-size:13px;padding:4px 8px">
+              <option value="resonant-seed-1b">resonant-seed-1b</option>
+            </select>
+            <button class="btn-sm" onclick="loadInferenceModels()">Refresh Models</button>
+          </div>
+          <div class="chat-container">
+            <div class="chat-messages" id="chat-messages"></div>
+            <div class="chat-input-row">
+              <textarea id="chat-input" placeholder="Type a message..." rows="1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat()}"></textarea>
+              <button onclick="sendChat()">Send</button>
+            </div>
           </div>
         </div>
       </div>
@@ -585,6 +673,9 @@ function switchTab(name) {
   document.querySelectorAll('.tab-content').forEach(t => t.classList.toggle('active', t.id === 'tab-'+name));
   if (name === 'network') loadNetworkHealth();
   if (name === 'chart') drawChart(state.loss_history || []);
+  if (name === 'metrics') loadMetrics();
+  if (name === 'model-dl') loadModelInfo();
+  if (name === 'inference') loadInferenceModels();
 }
 
 document.addEventListener('keydown', e => {
@@ -592,6 +683,180 @@ document.addEventListener('keydown', e => {
     if (state.status === 'training') stopMining(); else startMining();
   }
 });
+
+// ══════════════════════════════════════════════════════════════
+// DETAILED METRICS
+// ══════════════════════════════════════════════════════════════
+
+async function loadMetrics() {
+  try {
+    const r = await fetch('/api/metrics');
+    const d = await r.json();
+    renderMetricsSummary(d.summary || {});
+    renderMetricsTable(d.metrics || []);
+    loadParamServer();
+  } catch(e) { console.error('Metrics load error:', e); }
+}
+
+function renderMetricsSummary(s) {
+  const el = document.getElementById('metrics-summary');
+  if (!s || !s.total_cycles) {
+    el.innerHTML = '<div class="summary-item"><div class="val">&mdash;</div><div class="lbl">No data yet — run mining first</div></div>';
+    return;
+  }
+  el.innerHTML = `
+    <div class="summary-item"><div class="val">${s.total_cycles}</div><div class="lbl">Cycles</div></div>
+    <div class="summary-item"><div class="val">${s.avg_loss != null ? s.avg_loss.toFixed(4) : '—'}</div><div class="lbl">Avg Loss</div></div>
+    <div class="summary-item"><div class="val">${s.min_loss != null ? s.min_loss.toFixed(4) : '—'}</div><div class="lbl">Min Loss</div></div>
+    <div class="summary-item"><div class="val">${s.avg_grad_norm != null ? s.avg_grad_norm.toFixed(2) : '—'}</div><div class="lbl">Avg Grad Norm</div></div>
+    <div class="summary-item"><div class="val">${s.throughput_samples_per_sec || 0}</div><div class="lbl">Samples/sec</div></div>
+    <div class="summary-item"><div class="val">${s.total_samples ? s.total_samples.toLocaleString() : '0'}</div><div class="lbl">Total Samples</div></div>
+    <div class="summary-item"><div class="val">${s.total_training_time ? s.total_training_time.toFixed(0) + 's' : '—'}</div><div class="lbl">Total Time</div></div>
+  `;
+}
+
+function renderMetricsTable(metrics) {
+  const tbody = document.getElementById('metrics-tbody');
+  if (!metrics.length) {
+    tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--text2)">No training data yet</td></tr>';
+    return;
+  }
+  tbody.innerHTML = metrics.map(m => `<tr>
+    <td>${m.cycle}</td>
+    <td>${m.epoch}</td>
+    <td>${m.loss_before.toFixed(4)}</td>
+    <td style="color:var(--green)">${m.loss_after.toFixed(4)}</td>
+    <td style="color:${m.loss_delta > 0 ? 'var(--green)' : 'var(--red)'}">${m.loss_delta > 0 ? '+' : ''}${m.loss_delta.toFixed(4)}</td>
+    <td>${typeof m.grad_norm === 'number' ? m.grad_norm.toFixed(2) : '—'}</td>
+    <td>${m.learning_rate}</td>
+    <td>${m.samples_processed.toLocaleString()}</td>
+    <td>${m.throughput}/s</td>
+    <td>${m.compression_ratio ? m.compression_ratio.toFixed(0) + 'x' : '—'}</td>
+    <td>${m.training_time.toFixed(1)}s</td>
+  </tr>`).join('');
+}
+
+async function loadParamServer() {
+  const el = document.getElementById('param-server-info');
+  try {
+    const r = await fetch('/api/param-server');
+    const d = await r.json();
+    if (d.stats) {
+      const s = d.stats;
+      el.innerHTML = `
+        <div class="summary-grid">
+          <div class="summary-item"><div class="val">${s.global_step || 0}</div><div class="lbl">Global Step</div></div>
+          <div class="summary-item"><div class="val">${s.active_miners || 0}</div><div class="lbl">Active Miners</div></div>
+          <div class="summary-item"><div class="val">${s.total_aggregation_rounds || 0}</div><div class="lbl">Aggregation Rounds</div></div>
+          <div class="summary-item"><div class="val">${(s.total_samples_trained || 0).toLocaleString()}</div><div class="lbl">Network Samples</div></div>
+          <div class="summary-item"><div class="val">${s.total_gradients_received || 0}</div><div class="lbl">Gradients Received</div></div>
+          <div class="summary-item"><div class="val">${s.pending_gradients || 0}</div><div class="lbl">Pending</div></div>
+        </div>`;
+    } else {
+      el.innerHTML = '<span style="color:var(--text2)">Could not reach parameter server</span>';
+    }
+  } catch(e) {
+    el.innerHTML = '<span style="color:var(--red)">Error: ' + e.message + '</span>';
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+// MODEL DOWNLOAD
+// ══════════════════════════════════════════════════════════════
+
+async function loadModelInfo() {
+  const infoEl = document.getElementById('model-dl-info');
+  const btn = document.getElementById('btn-download');
+  try {
+    const r = await fetch('/api/model/info');
+    const d = await r.json();
+    if (d.available) {
+      infoEl.innerHTML = `<h4>${d.model_id}</h4><p>${d.cycles_trained} cycles trained on ${d.device}</p>`;
+      btn.disabled = false;
+    } else {
+      infoEl.innerHTML = '<h4>No model in memory</h4><p>Start mining to train a model, then come back to download the weights.</p>';
+      btn.disabled = true;
+    }
+  } catch(e) {
+    infoEl.innerHTML = '<h4>Error</h4><p>' + e.message + '</p>';
+    btn.disabled = true;
+  }
+}
+
+function downloadModel() {
+  window.location.href = '/api/model/download';
+}
+
+// ══════════════════════════════════════════════════════════════
+// LLM INFERENCE (Chat)
+// ══════════════════════════════════════════════════════════════
+
+let chatHistory = [];
+
+async function loadInferenceModels() {
+  try {
+    const r = await fetch('/api/inference/models');
+    const d = await r.json();
+    const select = document.getElementById('inference-model');
+    if (d.models && Array.isArray(d.models) && d.models.length > 0) {
+      select.innerHTML = d.models.map(m => `<option value="${m.id || m.model_id || m}">${m.id || m.model_id || m}</option>`).join('');
+    }
+  } catch(e) { console.warn('Could not load inference models:', e); }
+}
+
+async function sendChat() {
+  const input = document.getElementById('chat-input');
+  const msg = input.value.trim();
+  if (!msg) return;
+  input.value = '';
+
+  chatHistory.push({role: 'user', content: msg});
+  renderChat();
+
+  const model = document.getElementById('inference-model').value;
+  const headers = {'Content-Type': 'application/json'};
+  if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
+
+  // Show typing indicator
+  const msgsEl = document.getElementById('chat-messages');
+  const typing = document.createElement('div');
+  typing.className = 'chat-msg assistant';
+  typing.innerHTML = '<div class="role">assistant</div><span style="animation:pulse 1s infinite;color:var(--text2)">Thinking...</span>';
+  msgsEl.appendChild(typing);
+  msgsEl.scrollTop = msgsEl.scrollHeight;
+
+  try {
+    const r = await fetch('/api/inference/chat', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ model, messages: chatHistory, max_tokens: 1024, temperature: 0.7 }),
+    });
+    typing.remove();
+    if (r.ok) {
+      const d = await r.json();
+      const reply = d.choices?.[0]?.message?.content || d.response || JSON.stringify(d);
+      chatHistory.push({role: 'assistant', content: reply});
+    } else {
+      const err = await r.json().catch(() => ({detail: 'Request failed'}));
+      chatHistory.push({role: 'assistant', content: '[Error] ' + (err.detail || r.statusText)});
+    }
+  } catch(e) {
+    typing.remove();
+    chatHistory.push({role: 'assistant', content: '[Error] ' + e.message});
+  }
+  renderChat();
+}
+
+function renderChat() {
+  const el = document.getElementById('chat-messages');
+  el.innerHTML = chatHistory.map(m => `
+    <div class="chat-msg ${m.role}">
+      <div class="role">${m.role}</div>
+      <div>${escHtml(m.content)}</div>
+    </div>
+  `).join('');
+  el.scrollTop = el.scrollHeight;
+}
 </script>
 </body>
 </html>

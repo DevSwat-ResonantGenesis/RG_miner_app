@@ -194,6 +194,7 @@ miner_state = {
     "loss_history": [],
     "reward_history": [],
     "training_log": [],
+    "detailed_metrics": [],  # Per-cycle: epoch, grad_norm, throughput, LR, compression, etc.
     "model_id": "resonant-seed-1b",
     "device": "cpu",
     "real_training": False,
@@ -205,6 +206,7 @@ _training_task: Optional[asyncio.Task] = None
 _ws_clients: set = set()
 _session_token: Optional[str] = None  # Random token set on auth, checked via cookie
 _csrf_token: Optional[str] = None  # CSRF token, regenerated per session
+_model_ref = None  # Persistent model reference for download
 
 
 # ── Helpers ──
@@ -533,6 +535,143 @@ async def get_dashboard_data():
         return {"error": str(e)}
 
 
+# ── Detailed Metrics ──
+
+@app.get("/api/metrics")
+async def get_metrics():
+    """Return detailed per-cycle training metrics."""
+    return {
+        "metrics": miner_state["detailed_metrics"],
+        "summary": _compute_metrics_summary(),
+    }
+
+
+@app.get("/api/param-server")
+async def get_param_server():
+    """Proxy parameter server stats + miner list from mining service."""
+    urls = _platform_urls()
+    token = miner_state.get("jwt_token", "")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    result = {}
+    try:
+        async with httpx.AsyncClient(timeout=10, headers=headers) as client:
+            for key, path in [("stats", "/mining/param-server/stats"), ("miners", "/mining/miners"), ("tasks", "/mining/tasks/stats")]:
+                try:
+                    resp = await client.get(f"{urls['mining']}{path}")
+                    result[key] = resp.json() if resp.status_code == 200 else {"error": resp.status_code}
+                except Exception as e:
+                    result[key] = {"error": str(e)}
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
+def _compute_metrics_summary() -> dict:
+    """Compute aggregate summary from detailed metrics."""
+    metrics = miner_state["detailed_metrics"]
+    if not metrics:
+        return {}
+    total_time = sum(m.get("training_time", 0) for m in metrics)
+    total_samples = sum(m.get("samples_processed", 0) for m in metrics)
+    losses = [m["loss_after"] for m in metrics if "loss_after" in m]
+    grad_norms = [m["grad_norm"] for m in metrics if "grad_norm" in m]
+    return {
+        "total_cycles": len(metrics),
+        "total_training_time": round(total_time, 1),
+        "total_samples": total_samples,
+        "avg_loss": round(sum(losses) / len(losses), 6) if losses else None,
+        "min_loss": round(min(losses), 6) if losses else None,
+        "max_loss": round(max(losses), 6) if losses else None,
+        "avg_grad_norm": round(sum(grad_norms) / len(grad_norms), 4) if grad_norms else None,
+        "throughput_samples_per_sec": round(total_samples / total_time, 1) if total_time > 0 else 0,
+    }
+
+
+# ── Model Download ──
+
+@app.get("/api/model/info")
+async def model_info():
+    """Get info about the locally trained model — whether it can be downloaded."""
+    has_model = _model_ref is not None
+    return {
+        "available": has_model,
+        "model_id": miner_state["model_id"],
+        "cycles_trained": miner_state["cycles_completed"],
+        "device": miner_state["device"],
+    }
+
+
+@app.get("/api/model/download")
+async def model_download(request: Request):
+    """Download the local model weights as a .pt file."""
+    if _model_ref is None:
+        raise HTTPException(status_code=404, detail="No model in memory — train at least 1 cycle first")
+    # Require auth
+    cookie = request.cookies.get("rg_session")
+    if not (_session_token and cookie == _session_token):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        import torch
+        import io
+        buffer = io.BytesIO()
+        torch.save(_model_ref.state_dict(), buffer)
+        buffer.seek(0)
+        model_id = miner_state["model_id"]
+        step = miner_state["cycles_completed"]
+        from fastapi.responses import StreamingResponse
+        return StreamingResponse(
+            buffer,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{model_id}_step{step}.pt"'},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to export model: {e}")
+
+
+# ── LLM Inference Proxy ──
+
+@app.post("/api/inference/chat")
+async def inference_chat(request: Request):
+    """Proxy chat completions to platform LLM providers."""
+    cookie = request.cookies.get("rg_session")
+    if not (_session_token and cookie == _session_token):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    _check_csrf(request)
+    token = miner_state.get("jwt_token", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated with platform")
+    body = await request.json()
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                f"{PROD_BASE}/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json=body,
+            )
+            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM provider error: {e}")
+
+
+@app.get("/api/inference/models")
+async def inference_models():
+    """List available LLM models from platform."""
+    token = miner_state.get("jwt_token", "")
+    if not token:
+        return {"models": [], "error": "Not authenticated"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{PROD_BASE}/api/v1/models",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            return {"models": [], "error": f"HTTP {resp.status_code}"}
+    except Exception as e:
+        return {"models": [], "error": str(e)}
+
+
 # ── WebSocket for live updates ──
 
 @app.websocket("/ws")
@@ -762,11 +901,35 @@ async def _mining_loop(num_cycles: int):
                         await broadcast({"type": "error", "message": f"Training failed: {e}"})
                         continue
 
+                    global _model_ref
+                    _model_ref = model  # Persist for download
+
                     elapsed = time.time() - train_start
                     loss_b = grad_data["loss_before"]
                     loss_a = grad_data["loss_after"]
                     miner_state["current_loss"] = loss_a
                     miner_state["loss_history"].append({"cycle": cycle, "loss_before": loss_b, "loss_after": loss_a, "time": elapsed})
+
+                    # Store detailed metrics for metrics panel
+                    miner_state["detailed_metrics"].append({
+                        "cycle": cycle,
+                        "epoch": task.get("epoch", 0),
+                        "batch_index": task.get("batch_index", 0),
+                        "loss_before": loss_b,
+                        "loss_after": loss_a,
+                        "loss_delta": round(loss_b - loss_a, 6),
+                        "grad_norm": grad_data.get("grad_norm", 0),
+                        "learning_rate": task.get("learning_rate", 3e-4),
+                        "training_time": elapsed,
+                        "samples_processed": grad_data.get("samples_processed", 0),
+                        "original_size": grad_data.get("original_size", 0),
+                        "compressed_size": grad_data.get("compressed_size", 0),
+                        "compression_ratio": grad_data.get("compression_ratio", 0),
+                        "gradient_hash": grad_data.get("gradient_hash", "")[:16],
+                        "device": grad_data.get("device", ""),
+                        "throughput": round(grad_data.get("samples_processed", 0) / max(elapsed, 0.01), 1),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
 
                     log_event(f"Loss: {loss_b:.4f} → {loss_a:.4f} (Δ {loss_b - loss_a:.4f}) | {elapsed:.1f}s")
                     log_event(f"Compression: {grad_data['original_size']:,} → {grad_data['compressed_size']:,} ({grad_data['compression_ratio']:.0f}x)")
