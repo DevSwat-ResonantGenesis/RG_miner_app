@@ -289,6 +289,12 @@ class WebRTCClient:
             try:
                 if isinstance(message, str):
                     data = json.loads(message)
+                    
+                    # Handle weight transfer requests
+                    if data.get("type") == "weight-transfer-request":
+                        asyncio.create_task(self._handle_weight_transfer_request(peer_id, data))
+                        return
+                    
                 else:
                     # Binary data (weight tensors)
                     data = {"type": "binary", "data": message}
@@ -390,6 +396,63 @@ class WebRTCClient:
         
         return len(self.connected_peers) >= expected_count
     
+    async def serve_weight_shard(
+        self,
+        model_id: str,
+        layer_start: int,
+        layer_end: int,
+        weight_data: bytes,
+        weight_hash: str,
+    ) -> bool:
+        """
+        Serve a weight shard to requesting peers via WebRTC DataChannel.
+        
+        Automatically responds to weight-transfer-request messages.
+        """
+        # Store the weight data for serving
+        shard_key = f"{model_id}:L{layer_start}-{layer_end}"
+        self._weight_shards = getattr(self, "_weight_shards", {})
+        self._weight_shards[shard_key] = {
+            "data": weight_data,
+            "hash": weight_hash,
+            "size": len(weight_data),
+        }
+        
+        logger.info(f"Registered weight shard for serving: {shard_key}")
+        return True
+    
+    async def _handle_weight_transfer_request(self, from_peer_id: str, request: Dict):
+        """Handle incoming weight transfer request."""
+        shard_key = f"{request['model_id']}:L{request['layer_start']}-{request['layer_end']}"
+        
+        # Check if we have this shard
+        shard_info = getattr(self, "_weight_shards", {}).get(shard_key)
+        if not shard_info:
+            await self.send_to_peer(from_peer_id, {
+                "type": "weight-transfer-response",
+                "transfer_id": request.get("transfer_id"),
+                "status": "error",
+                "error": "Shard not available",
+            })
+            return
+        
+        # Send the weight data
+        success = await self.send_to_peer(from_peer_id, {
+            "type": "binary",
+            "data": shard_info["data"],
+            "metadata": {
+                "transfer_id": request.get("transfer_id"),
+                "shard_key": shard_key,
+                "weight_hash": shard_info["hash"],
+                "size": shard_info["size"],
+            },
+        })
+        
+        if success:
+            logger.info(f"Sent weight shard {shard_key} to {from_peer_id}")
+        else:
+            logger.error(f"Failed to send weight shard {shard_key} to {from_peer_id}")
+    
     def get_status(self) -> Dict:
         """Get current connection status."""
         return {
@@ -400,6 +463,7 @@ class WebRTCClient:
             "peer_connections": list(self.peer_connections.keys()),
             "data_channels": list(self.data_channels.keys()),
             "message_queue_size": self.message_queue.qsize(),
+            "serving_shards": len(getattr(self, "_weight_shards", {})),
         }
 
 
