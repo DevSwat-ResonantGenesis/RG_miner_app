@@ -1369,6 +1369,176 @@ def _real_training_step(task: dict, cycle: int, model, data, device_str: str):
     return grad_data, model, data
 
 
+async def _pipeline_training_step(
+    task: dict,
+    cycle: int,
+    model,
+    data,
+    device_str: str,
+    num_microbatches: int = 4,
+):
+    """
+    Pipeline-parallel training step using 1F1B microbatch scheduling.
+
+    Used when the miner is assigned to a pipeline group (is_sharded=True).
+    Instead of a simple forward/backward on the full batch, this:
+      1. Generates a 1F1B schedule for our stage
+      2. Splits the batch into microbatches
+      3. Executes warmup → steady-state → cooldown
+      4. Sends/receives activations to/from pipeline peers via P2P
+      5. Accumulates and compresses gradients across microbatches
+
+    Falls back to _real_training_step if engine setup fails.
+    """
+    import torch
+    from real_trainer import get_tokenizer, DataShardLoader, compress_gradients
+    from microbatch_engine import MicrobatchEngine, generate_local_1f1b_schedule
+
+    assignment = miner_state.get("shard_assignment", {})
+    stage_index = assignment.get("stage_index", 0)
+    num_stages = assignment.get("num_stages", 1)
+
+    device = torch.device(device_str)
+
+    # Scale parameters for device memory
+    if device_str in ("mps", "cpu"):
+        max_seq = 512
+        bs = max(2, num_microbatches)  # Need at least num_microbatches samples
+    else:
+        max_seq = task.get("max_seq_length", 4096)
+        bs = max(task.get("batch_size", 8), num_microbatches)
+
+    # Init model on first call
+    if model is None:
+        model = _create_model_or_shard(task, assignment, device_str)
+
+    # Init data on first call
+    if data is None:
+        tok = get_tokenizer()
+        loader = DataShardLoader(tok, max_seq_length=max_seq)
+        try:
+            data = loader.load_from_huggingface(num_samples=max(50, bs * 20))
+        except Exception:
+            data = loader._generate_synthetic_data(max(50, bs * 20))
+
+    lr = task.get("learning_rate", 3e-4)
+    start_idx = (cycle * bs) % len(data)
+    batch = data[start_idx:start_idx + bs]
+    if len(batch) < bs:
+        batch = data[:bs]
+
+    input_ids = batch[:, :-1].to(device)
+    labels = batch[:, 1:].to(device)
+
+    # Pre-training loss (last stage only, or single-stage)
+    loss_before = 0.0
+    is_last = (stage_index == num_stages - 1)
+    is_first = (stage_index == 0)
+    if is_last or num_stages == 1:
+        model.eval()
+        with torch.no_grad():
+            if is_first:
+                pre = model(hidden_states=None, input_ids=input_ids, labels=labels)
+            else:
+                # Middle/last stage can't compute pre-loss without upstream activation
+                pre = {"loss": torch.tensor(0.0)}
+            loss_before = pre.get("loss", pre.get("total_loss", torch.tensor(0.0))).item()
+        model.train()
+
+    # Create engine
+    engine = MicrobatchEngine(
+        model=model,
+        device=device_str,
+        stage_index=stage_index,
+        num_stages=num_stages,
+        miner_id=miner_state.get("miner_id", ""),
+    )
+
+    # Wire P2P callbacks
+    downstream_peer = miner_state.get("downstream_peer")
+    upstream_peer = miner_state.get("upstream_peer")
+
+    async def send_activation(payload: dict) -> bool:
+        if downstream_peer:
+            return await _send_activation_to_peer(downstream_peer, payload)
+        return True
+
+    async def send_gradient(payload: dict) -> bool:
+        if upstream_peer:
+            return await _send_activation_to_peer(upstream_peer, payload)
+        return True
+
+    async def recv_activation(timeout: float = 120.0):
+        return await _wait_for_upstream_activation(timeout)
+
+    async def recv_gradient(timeout: float = 120.0):
+        return await _wait_for_downstream_gradient(timeout)
+
+    engine.set_p2p_callbacks(
+        send_activation=send_activation,
+        send_gradient=send_gradient,
+        recv_activation=recv_activation,
+        recv_gradient=recv_gradient,
+    )
+
+    # Generate 1F1B schedule for our stage
+    schedule_steps = generate_local_1f1b_schedule(
+        stage_index=stage_index,
+        num_stages=num_stages,
+        num_microbatches=num_microbatches,
+    )
+
+    log_event(
+        f"1F1B: stage {stage_index}/{num_stages} | "
+        f"{num_microbatches} microbatches | "
+        f"{len(schedule_steps)} schedule steps"
+    )
+
+    # Execute the 1F1B schedule
+    result = await engine.execute(
+        schedule_steps=schedule_steps,
+        input_data=input_ids if is_first else None,
+        labels_data=labels if is_last else None,
+        learning_rate=lr,
+        num_microbatches=num_microbatches,
+    )
+
+    # Compress gradients for submission
+    grad_vector = result["grad_vector"]
+    compressed = compress_gradients(
+        {"flat": grad_vector.numpy()},
+        top_k_ratio=0.0001,
+    ) if len(grad_vector) > 0 else {
+        "top_k_indices": [], "top_k_values": [],
+        "original_size": 0, "compressed_size": 0,
+        "compression_ratio": 1.0, "gradient_hash": "",
+    }
+
+    grad_data = {
+        "top_k_indices": compressed.get("top_k_indices", []),
+        "top_k_values": compressed.get("top_k_values", []),
+        "original_size": compressed.get("original_size", 0),
+        "compressed_size": compressed.get("compressed_size", 0),
+        "compression_ratio": compressed.get("compression_ratio", 1.0),
+        "gradient_hash": compressed.get("gradient_hash", ""),
+        "loss_before": round(loss_before, 6),
+        "loss_after": round(result.get("loss_after", result.get("avg_loss", 0.0)), 6),
+        "samples_processed": bs,
+        "training_time_seconds": round(result["stats"]["total_time_sec"], 2),
+        "device": device_str,
+        "grad_norm": result.get("grad_norm", 0.0),
+        "real_training": True,
+        "pipeline_mode": True,
+        "num_microbatches": num_microbatches,
+        "stage_index": stage_index,
+        "num_stages": num_stages,
+        "gpu_utilization": result["stats"]["gpu_utilization"],
+        "engine_stats": result["stats"],
+    }
+
+    return grad_data, model, data
+
+
 async def _mining_loop(num_cycles: int):
     """Background mining loop — connects to production via WebSocket."""
     try:
@@ -1530,18 +1700,39 @@ async def _mining_loop(num_cycles: int):
                     task = task_msg["task"]
                     log_event(f"Task: {task['task_id'][:12]}... | Epoch {task['epoch']} | Batch {task['batch_index']}")
 
-                    # Train (real GPU training only — no simulation)
+                    # Train — pipeline-parallel (1F1B) or full-model
                     train_start = time.time()
-                    log_event(f"Training on {dev_name}...")
-                    try:
-                        grad_data, model, data = await asyncio.to_thread(
-                            _real_training_step, task, cycle, model, data, dev,
-                        )
-                    except Exception as e:
-                        log_event(f"Training failed: {e}", "error")
-                        miner_state["error"] = str(e)
-                        await broadcast({"type": "error", "message": f"Training failed: {e}"})
-                        continue
+                    use_pipeline = miner_state.get("is_sharded", False) and miner_state.get("shard_assignment")
+                    if use_pipeline:
+                        num_stages = miner_state["shard_assignment"].get("num_stages", 1)
+                        num_mb = max(num_stages, 4)  # At least as many microbatches as stages
+                        log_event(f"1F1B pipeline training on {dev_name} ({num_mb} microbatches)...")
+                        try:
+                            grad_data, model, data = await _pipeline_training_step(
+                                task, cycle, model, data, dev, num_microbatches=num_mb,
+                            )
+                        except Exception as e:
+                            log_event(f"Pipeline training failed, falling back to standard: {e}", "warning")
+                            try:
+                                grad_data, model, data = await asyncio.to_thread(
+                                    _real_training_step, task, cycle, model, data, dev,
+                                )
+                            except Exception as e2:
+                                log_event(f"Training failed: {e2}", "error")
+                                miner_state["error"] = str(e2)
+                                await broadcast({"type": "error", "message": f"Training failed: {e2}"})
+                                continue
+                    else:
+                        log_event(f"Training on {dev_name}...")
+                        try:
+                            grad_data, model, data = await asyncio.to_thread(
+                                _real_training_step, task, cycle, model, data, dev,
+                            )
+                        except Exception as e:
+                            log_event(f"Training failed: {e}", "error")
+                            miner_state["error"] = str(e)
+                            await broadcast({"type": "error", "message": f"Training failed: {e}"})
+                            continue
 
                     global _model_ref
                     _model_ref = model  # Persist for download
