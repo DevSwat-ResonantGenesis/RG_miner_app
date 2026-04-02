@@ -291,16 +291,34 @@ a { color: var(--accent2); text-decoration: none; }
 
       <div id="tab-model-dl" class="tab-content">
         <div class="card">
-          <h3>Model Weights</h3>
-          <p style="font-size:13px;color:var(--text2);margin-bottom:16px">Download the locally trained model weights as a PyTorch .pt checkpoint file. The model must have completed at least 1 training cycle.</p>
+          <h3>Where Does the Model Live?</h3>
+          <p style="font-size:13px;color:var(--text2);margin-bottom:12px">
+            The training network is <strong>federated</strong> — each miner holds a full model copy locally, trains on their GPU, and sends <em>compressed gradients</em> to the network. The parameter server merges gradients from all miners.
+          </p>
+          <div class="summary-grid" id="network-model-info">
+            <div class="summary-item"><div class="val">—</div><div class="lbl">Network Global Step</div></div>
+            <div class="summary-item"><div class="val">—</div><div class="lbl">Active Miners</div></div>
+            <div class="summary-item"><div class="val">—</div><div class="lbl">Network Samples</div></div>
+            <div class="summary-item"><div class="val">—</div><div class="lbl">Aggregation Rounds</div></div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <h3>Local Model</h3>
           <div class="download-section" id="model-dl-section">
             <div class="icon">&#128190;</div>
             <div class="info" id="model-dl-info">
-              <h4>Checking model status...</h4>
-              <p>Loading...</p>
+              <h4>Checking...</h4>
+              <p>Loading model status...</p>
             </div>
             <button class="btn btn-success" id="btn-download" onclick="downloadModel()" disabled>Download .pt</button>
           </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <h3>Saved Checkpoints <span style="font-size:11px;color:var(--text2)">(~/.rg_miner/checkpoints/)</span></h3>
+          <p style="font-size:12px;color:var(--text2);margin-bottom:8px">Auto-saved after each accepted gradient. Last 3 kept per model.</p>
+          <div id="checkpoint-list" style="font-size:13px;color:var(--text2)">Loading...</div>
         </div>
       </div>
 
@@ -767,24 +785,63 @@ async function loadParamServer() {
 async function loadModelInfo() {
   const infoEl = document.getElementById('model-dl-info');
   const btn = document.getElementById('btn-download');
+  const ckptList = document.getElementById('checkpoint-list');
+
+  // Load local model info + checkpoints
   try {
     const r = await fetch('/api/model/info');
     const d = await r.json();
-    if (d.available) {
-      infoEl.innerHTML = `<h4>${d.model_id}</h4><p>${d.cycles_trained} cycles trained on ${d.device}</p>`;
+    const hasAny = d.in_memory || (d.checkpoints && d.checkpoints.length > 0);
+    if (d.in_memory) {
+      infoEl.innerHTML = `<h4>${d.model_id} <span style="color:var(--green)">(in memory)</span></h4><p>${d.cycles_trained} cycles trained on ${d.device}</p>`;
+      btn.disabled = false;
+    } else if (d.checkpoints && d.checkpoints.length > 0) {
+      infoEl.innerHTML = `<h4>${d.model_id} <span style="color:var(--yellow)">(on disk)</span></h4><p>Not in memory — ${d.checkpoints.length} checkpoint(s) saved. Will download from disk.</p>`;
       btn.disabled = false;
     } else {
-      infoEl.innerHTML = '<h4>No model in memory</h4><p>Start mining to train a model, then come back to download the weights.</p>';
+      infoEl.innerHTML = '<h4>No model available</h4><p>Start mining to train a model. Checkpoints are auto-saved after each accepted gradient.</p>';
       btn.disabled = true;
+    }
+    // Render checkpoints
+    if (d.checkpoints && d.checkpoints.length > 0) {
+      ckptList.innerHTML = d.checkpoints.map(c => `
+        <div class="download-section" style="margin-bottom:8px;padding:10px">
+          <div class="icon" style="font-size:20px">&#128196;</div>
+          <div class="info">
+            <h4 style="font-size:13px">${c.filename}</h4>
+            <p>Step ${c.step || '?'} | ${c.size_mb} MB | ${c.saved_at ? new Date(c.saved_at).toLocaleString() : '—'}</p>
+          </div>
+          <button class="btn-sm" onclick="downloadCheckpoint('${c.filename}')">Download</button>
+        </div>
+      `).join('');
+    } else {
+      ckptList.innerHTML = '<span style="color:var(--text2)">No checkpoints yet — they appear here after training.</span>';
     }
   } catch(e) {
     infoEl.innerHTML = '<h4>Error</h4><p>' + e.message + '</p>';
     btn.disabled = true;
   }
+
+  // Load network model status
+  try {
+    const r = await fetch('/api/model/network-status');
+    const d = await r.json();
+    const el = document.getElementById('network-model-info');
+    el.innerHTML = `
+      <div class="summary-item"><div class="val">${d.global_step != null ? d.global_step : '—'}</div><div class="lbl">Network Global Step</div></div>
+      <div class="summary-item"><div class="val">${d.active_miners != null ? d.active_miners : '—'}</div><div class="lbl">Active Miners</div></div>
+      <div class="summary-item"><div class="val">${d.total_samples != null ? d.total_samples.toLocaleString() : '—'}</div><div class="lbl">Network Samples</div></div>
+      <div class="summary-item"><div class="val">${d.aggregation_rounds != null ? d.aggregation_rounds : '—'}</div><div class="lbl">Aggregation Rounds</div></div>
+    `;
+  } catch(e) {}
 }
 
 function downloadModel() {
   window.location.href = '/api/model/download';
+}
+
+function downloadCheckpoint(filename) {
+  window.location.href = '/api/model/download?checkpoint=' + encodeURIComponent(filename);
 }
 
 // ══════════════════════════════════════════════════════════════

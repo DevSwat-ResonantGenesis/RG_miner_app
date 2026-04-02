@@ -154,6 +154,77 @@ async def _resolve_platform() -> str:
     return PROD_BASE
 
 
+_CHECKPOINT_DIR = _TOKEN_DIR / "checkpoints"
+
+
+def _save_checkpoint(model, model_id: str, step: int) -> Optional[str]:
+    """Save model checkpoint locally. Returns path or None."""
+    try:
+        import torch
+        _CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        filename = f"{model_id}_step{step}.pt"
+        path = _CHECKPOINT_DIR / filename
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "model_id": model_id,
+            "step": step,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }, str(path))
+        # Keep only latest 3 checkpoints per model
+        existing = sorted(_CHECKPOINT_DIR.glob(f"{model_id}_step*.pt"), key=lambda p: p.stat().st_mtime)
+        for old in existing[:-3]:
+            old.unlink()
+        logger.info(f"Checkpoint saved: {path} ({path.stat().st_size / 1024 / 1024:.1f} MB)")
+        return str(path)
+    except Exception as e:
+        logger.warning(f"Failed to save checkpoint: {e}")
+        return None
+
+
+def _load_latest_checkpoint(model_id: str = "resonant-seed-1b"):
+    """Load latest checkpoint if exists. Returns (model, step) or (None, 0)."""
+    try:
+        import torch
+        from model_architecture import create_model
+        if not _CHECKPOINT_DIR.exists():
+            return None, 0
+        checkpoints = sorted(_CHECKPOINT_DIR.glob(f"{model_id}_step*.pt"), key=lambda p: p.stat().st_mtime)
+        if not checkpoints:
+            return None, 0
+        latest = checkpoints[-1]
+        data = torch.load(str(latest), map_location="cpu")
+        model, _ = create_model(model_id)
+        model.load_state_dict(data["model_state_dict"])
+        step = data.get("step", 0)
+        logger.info(f"Loaded checkpoint: {latest.name} (step {step}, {latest.stat().st_size / 1024 / 1024:.1f} MB)")
+        return model, step
+    except Exception as e:
+        logger.warning(f"Failed to load checkpoint: {e}")
+        return None, 0
+
+
+def _list_checkpoints() -> list:
+    """List all local checkpoints with metadata."""
+    result = []
+    if not _CHECKPOINT_DIR.exists():
+        return result
+    for path in sorted(_CHECKPOINT_DIR.glob("*.pt"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            import torch
+            data = torch.load(str(path), map_location="cpu", weights_only=False)
+            result.append({
+                "filename": path.name,
+                "model_id": data.get("model_id", "unknown"),
+                "step": data.get("step", 0),
+                "saved_at": data.get("saved_at", ""),
+                "size_mb": round(path.stat().st_size / 1024 / 1024, 1),
+                "path": str(path),
+            })
+        except Exception:
+            result.append({"filename": path.name, "size_mb": round(path.stat().st_size / 1024 / 1024, 1), "path": str(path)})
+    return result
+
+
 def _platform_urls():
     """Return current platform URLs derived from PROD_BASE."""
     host = PROD_BASE.replace("https://", "").replace("http://", "")
@@ -277,6 +348,13 @@ async def lifespan(app: FastAPI):
         miner_state["user_id"] = stored.get("user_id", "")
         miner_state["user_name"] = stored.get("user_name", "")
         miner_state["miner_id"] = f"miner-{stored.get('email', 'user').split('@')[0]}-{uuid4().hex[:6]}"
+    # Try to load latest checkpoint
+    global _model_ref
+    model, step = _load_latest_checkpoint(miner_state["model_id"])
+    if model is not None:
+        _model_ref = model
+        miner_state["cycles_completed"] = step
+        logger.info(f"  Model restored: {miner_state['model_id']} at step {step}")
     yield
     if _training_task and not _training_task.done():
         _training_task.cancel()
@@ -591,41 +669,112 @@ def _compute_metrics_summary() -> dict:
 
 @app.get("/api/model/info")
 async def model_info():
-    """Get info about the locally trained model — whether it can be downloaded."""
+    """Get info about the locally trained model + saved checkpoints."""
     has_model = _model_ref is not None
+    checkpoints = _list_checkpoints()
     return {
-        "available": has_model,
+        "in_memory": has_model,
         "model_id": miner_state["model_id"],
         "cycles_trained": miner_state["cycles_completed"],
         "device": miner_state["device"],
+        "checkpoints": checkpoints,
+        "checkpoint_dir": str(_CHECKPOINT_DIR),
     }
 
 
 @app.get("/api/model/download")
-async def model_download(request: Request):
-    """Download the local model weights as a .pt file."""
-    if _model_ref is None:
-        raise HTTPException(status_code=404, detail="No model in memory — train at least 1 cycle first")
-    # Require auth
+async def model_download(request: Request, checkpoint: Optional[str] = None):
+    """Download model weights as a .pt file. Optionally specify a checkpoint filename."""
     cookie = request.cookies.get("rg_session")
     if not (_session_token and cookie == _session_token):
         raise HTTPException(status_code=401, detail="Authentication required")
     try:
         import torch
         import io
+        from fastapi.responses import StreamingResponse
+
+        if checkpoint:
+            # Download a specific checkpoint from disk
+            ckpt_path = _CHECKPOINT_DIR / checkpoint
+            if not ckpt_path.exists() or not str(ckpt_path).startswith(str(_CHECKPOINT_DIR)):
+                raise HTTPException(status_code=404, detail="Checkpoint not found")
+            return StreamingResponse(
+                open(str(ckpt_path), "rb"),
+                media_type="application/octet-stream",
+                headers={"Content-Disposition": f'attachment; filename="{checkpoint}"'},
+            )
+
+        if _model_ref is None:
+            # Try loading latest checkpoint from disk
+            checkpoints = _list_checkpoints()
+            if checkpoints:
+                ckpt_path = checkpoints[0]["path"]
+                return StreamingResponse(
+                    open(ckpt_path, "rb"),
+                    media_type="application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{Path(ckpt_path).name}"'},
+                )
+            raise HTTPException(status_code=404, detail="No model in memory and no checkpoints on disk — train at least 1 cycle first")
+
         buffer = io.BytesIO()
         torch.save(_model_ref.state_dict(), buffer)
         buffer.seek(0)
         model_id = miner_state["model_id"]
         step = miner_state["cycles_completed"]
-        from fastapi.responses import StreamingResponse
         return StreamingResponse(
             buffer,
             media_type="application/octet-stream",
             headers={"Content-Disposition": f'attachment; filename="{model_id}_step{step}.pt"'},
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to export model: {e}")
+
+
+@app.get("/api/model/load-checkpoint")
+async def load_checkpoint_endpoint(request: Request):
+    """Load latest checkpoint from disk into memory (after restart)."""
+    cookie = request.cookies.get("rg_session")
+    if not (_session_token and cookie == _session_token):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    global _model_ref
+    model, step = _load_latest_checkpoint(miner_state["model_id"])
+    if model is not None:
+        _model_ref = model
+        miner_state["cycles_completed"] = step
+        return {"status": "loaded", "model_id": miner_state["model_id"], "step": step}
+    return {"status": "no_checkpoint", "message": "No checkpoint files found"}
+
+
+@app.get("/api/model/network-status")
+async def network_model_status():
+    """Query the parameter server for the current global model state."""
+    urls = _platform_urls()
+    token = miner_state.get("jwt_token", "")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    result = {"global_step": None, "active_miners": None, "total_samples": None, "weight_shards": []}
+    try:
+        async with httpx.AsyncClient(timeout=10, headers=headers) as client:
+            # Param server stats
+            resp = await client.get(f"{urls['mining']}/mining/param-server/stats")
+            if resp.status_code == 200:
+                stats = resp.json()
+                result["global_step"] = stats.get("global_step", 0)
+                result["active_miners"] = stats.get("active_miners", 0)
+                result["total_samples"] = stats.get("total_samples_trained", 0)
+                result["total_gradients"] = stats.get("total_gradients_received", 0)
+                result["aggregation_rounds"] = stats.get("total_aggregation_rounds", 0)
+            # Genesis status for model info
+            resp2 = await client.get(f"{urls['mining']}/mining/genesis/status")
+            if resp2.status_code == 200:
+                gs = resp2.json()
+                genesis = gs.get("genesis", gs)
+                result["model_id"] = genesis.get("model_id") or genesis.get("model_config", {}).get("model_id")
+                result["initialized"] = genesis.get("initialized", False)
+    except Exception as e:
+        result["error"] = str(e)
+    return result
 
 
 # ── LLM Inference Proxy ──
@@ -956,6 +1105,11 @@ async def _mining_loop(num_cycles: int):
                         miner_state["cycles_completed"] = cycle
                         miner_state["reward_history"].append({"cycle": cycle, "reward": reward})
                         log_event(f"✓ Gradient ACCEPTED — Reward: {reward} $RGT | Total: {miner_state['total_rgt']:.2f} $RGT")
+
+                        # Auto-save checkpoint locally
+                        ckpt_path = _save_checkpoint(model, miner_state["model_id"], cycle)
+                        if ckpt_path:
+                            log_event(f"💾 Checkpoint saved: ~/.rg_miner/checkpoints/{Path(ckpt_path).name}")
 
                         try:
                             agg_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
