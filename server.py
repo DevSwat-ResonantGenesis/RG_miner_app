@@ -35,10 +35,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+import secrets
 from uuid import uuid4
 
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -84,6 +85,7 @@ miner_state = {
 
 _training_task: Optional[asyncio.Task] = None
 _ws_clients: set = set()
+_session_token: Optional[str] = None  # Random token set on auth, checked via cookie
 
 
 # ── Helpers ──
@@ -186,6 +188,9 @@ async def auth_callback(request: Request):
     if not email:
         email = "user@resonantgenesis.com"
 
+    global _session_token
+    _session_token = secrets.token_urlsafe(32)
+
     miner_state["jwt_token"] = token
     miner_state["user_email"] = email
     miner_state["user_id"] = user_id
@@ -196,8 +201,8 @@ async def auth_callback(request: Request):
     dev, _, dev_name = _detect_device()
     logger.info(f"Authenticated: {email} | Device: {dev_name}")
 
-    # Show success page that auto-redirects to dashboard
-    return HTMLResponse(content=f"""
+    # Show success page that auto-redirects to dashboard (set session cookie)
+    response = HTMLResponse(content=f"""
     <!DOCTYPE html><html><head><meta charset="UTF-8">
     <title>RG Miner — Authenticated</title>
     <style>body{{background:#0a0a0f;color:#e0e0e8;font-family:system-ui;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
@@ -212,6 +217,15 @@ async def auth_callback(request: Request):
     <a class="btn" href="/">Open Dashboard</a>
     </div></body></html>
     """)
+    response.set_cookie(
+        key="rg_session",
+        value=_session_token,
+        httponly=True,
+        samesite="lax",
+        path="/",
+        max_age=86400,  # 24 hours
+    )
+    return response
 
 
 @app.get("/api/auth/url")
@@ -222,21 +236,25 @@ async def get_auth_url():
 
 
 @app.get("/api/auth/status")
-async def auth_status():
-    """Check if user is authenticated."""
-    if miner_state["jwt_token"]:
+async def auth_status(request: Request):
+    """Check if user is authenticated — requires valid session cookie."""
+    cookie = request.cookies.get("rg_session")
+    if _session_token and cookie == _session_token and miner_state["jwt_token"]:
         return {"authenticated": True, "email": miner_state["user_email"], "miner_id": miner_state["miner_id"]}
     return {"authenticated": False}
 
 
 @app.post("/api/logout")
 async def logout():
-    """Clear session."""
-    global _training_task
+    """Clear session and cookie."""
+    global _training_task, _session_token
     if _training_task and not _training_task.done():
         _training_task.cancel()
+    _session_token = None
     miner_state.update({"status": "idle", "jwt_token": None, "user_email": None, "miner_id": None, "user_id": None})
-    return {"success": True}
+    response = JSONResponse({"success": True})
+    response.delete_cookie("rg_session", path="/")
+    return response
 
 
 # ── Mining controls ──
