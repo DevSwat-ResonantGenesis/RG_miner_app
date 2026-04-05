@@ -1,0 +1,8 @@
+# Optional: P2P WebRTC direct miner-to-miner connections
+# Requires system dependencies: ffmpeg 7, pkg-config, C compiler
+# Install with: pip install -r requirements-p2p.txt
+#
+# macOS:  brew install ffmpeg pkg-config
+# Ubuntu: sudo apt install ffmpeg libavdevice-dev pkg-config
+# Then:   pip install -r requirements-p2p.txt
+aiortc>=1.6.0

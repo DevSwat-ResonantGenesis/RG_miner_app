@@ -46,6 +46,25 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 
 Run this **before** `pip install -r requirements.txt`, or it will install CPU-only PyTorch.
 
+### Optional: P2P WebRTC (direct miner-to-miner transfers)
+
+P2P WebRTC enables direct weight transfer between miners without going through the server. It's **not required** — the miner falls back to server-based transfers automatically.
+
+If you want P2P, you need system-level dependencies first:
+
+```bash
+# macOS
+brew install ffmpeg pkg-config
+
+# Ubuntu/Debian
+sudo apt install ffmpeg libavdevice-dev pkg-config
+
+# Then install the P2P package
+pip install -r requirements-p2p.txt
+```
+
+> If `pip install -r requirements.txt` fails with errors about **PyAV**, **ffmpeg**, or **aiortc** — you're hitting this. The fix is to skip P2P for now (it's already removed from the base requirements) and install it later if you want it.
+
 ---
 
 ## What This Actually Does
@@ -249,6 +268,7 @@ RG_miner_app/
 |-------|-----|
 | `command not found: python` | Use `python3` instead — macOS doesn't ship `python`. Once inside a venv, `python` works. |
 | `command not found: pip` | Use `pip3`, or activate your venv first (`source venv/bin/activate`), then `pip` works. |
+| `aiortc` / `PyAV` build error | This is optional. Skip it — the miner works without P2P WebRTC. See [Optional: P2P WebRTC](#optional-p2p-webrtc-direct-miner-to-miner-transfers) if you want it later. |
 | `torch not found` | `pip install torch` — or see [pytorch.org](https://pytorch.org/get-started/locally/) for CUDA-specific install |
 | `Connection refused` | Check that `RG_PLATFORM_URL` is reachable. The platform must be running. |
 | `No tasks available` | The network may not have started a training epoch yet. Wait or check the dashboard. |
