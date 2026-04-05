@@ -153,6 +153,26 @@ That's a closed utility loop — value comes from real platform usage, not excha
 
 The real break-even question isn't "when does $RGT hit X price on a DEX" — it's **"does my mining output cover what I'd otherwise pay in platform fees?"** If you're using the Resonant IDE, LLM APIs, or AI agents, mining makes those services effectively free.
 
+### Reward Security (Proof-of-Training)
+
+Unlike a simple "call an API and get tokens" system, every $RGT credit goes through **5 layers of verification** — similar to how Bitcoin ties coinbase rewards to proof-of-work:
+
+| Layer | What It Does | Bitcoin Equivalent |
+|-------|-------------|-------------------|
+| **1. Internal Key Auth** | Only the mining service (inside Docker network) can call the credit endpoint | Only valid blocks get coinbase rewards |
+| **2. Gradient Hash Required** | No hash = no credit — you must have actually processed a gradient | No PoW hash = no block |
+| **3. HMAC-SHA256 Signature** | Mining service signs `{gradient_hash}:{user_id}:{amount}:{timestamp}` with a shared secret. Crypto service verifies. | Block hash proves work was done |
+| **4. Replay Protection** | Each `gradient_hash` is recorded in an immutable ledger — can only be credited **once** | Each UTXO can only be spent once |
+| **5. Reward Cap** | Max **500 $RGT per credit call** — prevents inflation from any single request | Block reward limit (currently 3.125 BTC) |
+
+**Important:** The 500 $RGT cap is **per credit call**, not per session. Each mining cycle triggers one separate credit call (~100-150 $RGT depending on tier). So 5 cycles = 5 calls × ~150 = ~750 $RGT total — that's fine. The cap prevents a single malicious call from minting thousands of tokens, not legitimate multi-cycle mining.
+
+**What this means:** Even if someone obtained the internal service key, they cannot:
+- Credit tokens without a valid gradient hash (must actually train)
+- Replay the same gradient to double-claim rewards
+- Mint more than 500 $RGT in a single request
+- Use an expired signature (5-minute window)
+
 ### On-Chain Recording
 
 Every gradient submission and reward is recorded as a `training_gradient` transaction on the **ResonantGenesis Blockchain** (chain ID: `resonant-genesis-external-1`), which uses Raft consensus with Merkle-tree block validation. This creates an immutable provenance trail for all training contributions.

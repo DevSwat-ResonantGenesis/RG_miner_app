@@ -256,6 +256,7 @@ a { color: var(--accent2); text-decoration: none; }
         <div class="tab" data-tab="model-dl" onclick="switchTab('model-dl')">Model Download</div>
         <div class="tab" data-tab="inference" onclick="switchTab('inference')">LLM Inference</div>
         <div class="tab" data-tab="network" onclick="switchTab('network')">Network</div>
+        <div class="tab" data-tab="security" onclick="switchTab('security')">Security</div>
       </div>
 
       <div id="tab-log" class="tab-content active">
@@ -355,6 +356,59 @@ a { color: var(--accent2); text-decoration: none; }
 
       <div id="tab-network" class="tab-content">
         <div class="grid grid-3" id="network-cards"></div>
+      </div>
+
+      <div id="tab-security" class="tab-content">
+        <div class="card">
+          <h3>Proof-of-Training &mdash; How $RGT Rewards Are Secured</h3>
+          <p style="font-size:13px;color:var(--text2);margin-bottom:16px;line-height:1.6">
+            Every $RGT credit goes through <strong style="color:var(--text)">5 layers of verification</strong> before tokens reach your wallet.
+            This is similar to how Bitcoin ties coinbase rewards to proof-of-work &mdash; you can't just call an API and mint tokens.
+          </p>
+          <table class="metrics-table" style="font-family:inherit">
+            <thead><tr><th>#</th><th>Security Layer</th><th>What It Does</th><th>If Failed</th></tr></thead>
+            <tbody>
+              <tr><td style="color:var(--accent2);font-weight:700">1</td><td>Internal Key Auth</td><td>Only the mining service (inside Docker network) can call the credit endpoint</td><td style="color:var(--red)">403 Rejected</td></tr>
+              <tr><td style="color:var(--accent2);font-weight:700">2</td><td>Gradient Hash Required</td><td>No hash = no credit &mdash; must have actually processed a real gradient</td><td style="color:var(--red)">400 Rejected</td></tr>
+              <tr><td style="color:var(--accent2);font-weight:700">3</td><td>Reward Cap</td><td>Max <strong>500 $RGT</strong> per credit call &mdash; prevents inflation from any single request</td><td style="color:var(--red)">400 Rejected</td></tr>
+              <tr><td style="color:var(--accent2);font-weight:700">4</td><td>HMAC-SHA256 Signature</td><td>Mining service cryptographically signs each credit &mdash; crypto service verifies the signature</td><td style="color:var(--red)">403 Rejected</td></tr>
+              <tr><td style="color:var(--accent2);font-weight:700">5</td><td>Replay Protection</td><td>Each gradient hash recorded in immutable ledger &mdash; can only be credited <strong>once</strong></td><td style="color:var(--red)">409 Blocked</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <h3>Reward Economics Per Session</h3>
+          <p style="font-size:13px;color:var(--text2);margin-bottom:12px;line-height:1.6">
+            The 500 $RGT cap is <strong style="color:var(--text)">per credit call</strong>, not per session.
+            Each mining cycle triggers one separate credit call. Here's the math:
+          </p>
+          <div class="summary-grid">
+            <div class="summary-item"><div class="val">~150</div><div class="lbl">$RGT per cycle (T1 Validator)</div></div>
+            <div class="summary-item"><div class="val">~125</div><div class="lbl">$RGT per cycle (T2 Core)</div></div>
+            <div class="summary-item"><div class="val">~100</div><div class="lbl">$RGT per cycle (T3 Standard)</div></div>
+            <div class="summary-item"><div class="val">500</div><div class="lbl">Max per single credit call</div></div>
+          </div>
+          <p style="font-size:12px;color:var(--text2);margin-top:12px;line-height:1.6">
+            <strong style="color:var(--green)">Example:</strong> 5 cycles at T1 = 5 separate calls &times; 150 $RGT = 750 $RGT total.
+            Each call is 150 (under 500 cap) so all 5 credits succeed.
+            The cap blocks a single malicious call trying to mint 10,000+ $RGT at once.
+          </p>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <h3>Bitcoin Comparison</h3>
+          <table class="metrics-table" style="font-family:inherit">
+            <thead><tr><th>Concept</th><th>Bitcoin</th><th>ResonantGenesis</th></tr></thead>
+            <tbody>
+              <tr><td>Proof of work</td><td>SHA-256 hash below difficulty target</td><td>Gradient verified by parameter server</td></tr>
+              <tr><td>Reward anchor</td><td>Coinbase tx in consensus-validated block</td><td>HMAC-signed credit with gradient hash</td></tr>
+              <tr><td>Double-spend prevention</td><td>UTXO can only be spent once</td><td>Gradient hash can only be credited once</td></tr>
+              <tr><td>Inflation control</td><td>Block reward halving (3.125 BTC)</td><td>500 $RGT cap per call + yearly halving</td></tr>
+              <tr><td>On-chain record</td><td>Block added to longest chain</td><td>Gradient tx recorded on RG Blockchain</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   </div>
