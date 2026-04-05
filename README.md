@@ -13,6 +13,9 @@ Download, login, and start earning **$RGT tokens** by training AI models on your
 ### macOS
 
 ```bash
+# Install Homebrew (skip if you already have it)
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
 # Prerequisites (needed once — for P2P WebRTC)
 brew install ffmpeg pkg-config
 
