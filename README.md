@@ -10,9 +10,28 @@ Download, login, and start earning **$RGT tokens** by training AI models on your
 
 ## Quick Start
 
-### macOS / Linux
+### macOS
 
 ```bash
+# Prerequisites (needed once — for P2P WebRTC)
+brew install ffmpeg pkg-config
+
+# Setup
+git clone https://github.com/DevSwat-ResonantGenesis/RG_miner_app.git
+cd RG_miner_app
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+python server.py
+```
+
+### Linux (Ubuntu/Debian)
+
+```bash
+# Prerequisites (needed once — for P2P WebRTC)
+sudo apt install ffmpeg libavdevice-dev pkg-config
+
+# Setup
 git clone https://github.com/DevSwat-ResonantGenesis/RG_miner_app.git
 cd RG_miner_app
 python3 -m venv venv
@@ -32,6 +51,8 @@ pip install -r requirements.txt
 python server.py
 ```
 
+> **Windows note:** You may need to install ffmpeg separately for P2P WebRTC. Download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH.
+
 Then open **http://localhost:3000** and login with your [ResonantGenesis account](https://dev-swat.com).
 
 > **Important:** On macOS, the command is `python3` and `pip` (after activating the venv). If you see `zsh: command not found: python`, use `python3` instead. Once inside an activated venv, both `python` and `pip` work.
@@ -45,25 +66,6 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 ```
 
 Run this **before** `pip install -r requirements.txt`, or it will install CPU-only PyTorch.
-
-### Optional: P2P WebRTC (direct miner-to-miner transfers)
-
-P2P WebRTC enables direct weight transfer between miners without going through the server. It's **not required** — the miner falls back to server-based transfers automatically.
-
-If you want P2P, you need system-level dependencies first:
-
-```bash
-# macOS
-brew install ffmpeg pkg-config
-
-# Ubuntu/Debian
-sudo apt install ffmpeg libavdevice-dev pkg-config
-
-# Then install the P2P package
-pip install -r requirements-p2p.txt
-```
-
-> If `pip install -r requirements.txt` fails with errors about **PyAV**, **ffmpeg**, or **aiortc** — you're hitting this. The fix is to skip P2P for now (it's already removed from the base requirements) and install it later if you want it.
 
 ---
 
@@ -268,7 +270,7 @@ RG_miner_app/
 |-------|-----|
 | `command not found: python` | Use `python3` instead — macOS doesn't ship `python`. Once inside a venv, `python` works. |
 | `command not found: pip` | Use `pip3`, or activate your venv first (`source venv/bin/activate`), then `pip` works. |
-| `aiortc` / `PyAV` build error | This is optional. Skip it — the miner works without P2P WebRTC. See [Optional: P2P WebRTC](#optional-p2p-webrtc-direct-miner-to-miner-transfers) if you want it later. |
+| `aiortc` / `PyAV` build error | Install system prerequisites first: `brew install ffmpeg pkg-config` (macOS) or `sudo apt install ffmpeg libavdevice-dev pkg-config` (Linux). Then re-run `pip install -r requirements.txt`. |
 | `torch not found` | `pip install torch` — or see [pytorch.org](https://pytorch.org/get-started/locally/) for CUDA-specific install |
 | `Connection refused` | Check that `RG_PLATFORM_URL` is reachable. The platform must be running. |
 | `No tasks available` | The network may not have started a training epoch yet. Wait or check the dashboard. |
