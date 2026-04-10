@@ -10,6 +10,12 @@ Download, login, and start earning **$RGT tokens** by training AI models on your
 
 ## Quick Start
 
+### One-Line Install (macOS)
+
+```bash
+bash -lc 'set -e; command -v brew >/dev/null 2>&1 || /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; brew install ffmpeg pkg-config; [ -d RG_miner_app ] || git clone https://github.com/DevSwat-ResonantGenesis/RG_miner_app.git; cd RG_miner_app; python3 -m venv venv; source venv/bin/activate; pip install -r requirements.txt; python server.py'
+```
+
 ### macOS
 
 ```bash
